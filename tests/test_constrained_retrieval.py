@@ -6,7 +6,11 @@ runs without network access or real model downloads. P1 additions cover the
 metadata-index fast paths, incremental index maintenance, and the
 selectivity-driven ``candidate_uids`` pre-filter push-down; P2 additions cover
 the graph-neighborhood BFS resolver over ``SemanticGraph.rx_graph``; P2+
-additions cover maintenance of the relation-type inverted index.
+additions cover maintenance of the relation-type inverted index; P3 additions
+cover the degenerate-candidate fallback policy, selectivity-aware post-filter
+pool sizing, and the recorded mode rationale; the last two tests pin the
+``SemanticGraph`` facade fixes for the ``RetrievalMethod`` runtime ``NameError``
+and the misnamed node-search dispatch targets.
 """
 
 from __future__ import annotations
@@ -15,8 +19,10 @@ import numpy as np
 import pytest
 
 from mandol.constraints import (
+    DROP_CONSTRAINT,
     CandidateSet,
     ConstraintAwarePlanner,
+    FallbackPolicy,
     MetadataConstraintResolver,
     QueryConstraints,
     RelationConstraint,
@@ -28,6 +34,8 @@ from mandol.constraints import (
 from mandol.core.memory_unit import MemoryUnit
 from mandol.core.semantic_graph import SemanticGraph
 from mandol.core.semantic_map import SemanticMap
+from mandol.retrieval.retrieval_interface import RetrievalMethod
+from mandol.constraints import planner as constraint_planner_module
 from mandol.utils.model_manager import global_model_manager
 
 # uid, text, timestamp, speaker, space
@@ -104,6 +112,22 @@ def graph_factory(monkeypatch):
         return SemanticGraph(semantic_map)
 
     return create
+
+
+def _spy_on_planner_warnings(monkeypatch) -> list:
+    """Capture planner warnings as plain strings.
+
+    The project logger tree stops propagation before the root logger, so
+    ``caplog`` never sees these records; spying on ``logger.warning`` keeps the
+    assertion independent of the logging configuration.
+    """
+    messages: list = []
+    monkeypatch.setattr(
+        constraint_planner_module.logger,
+        "warning",
+        lambda message, *args: messages.append(message % args if args else message),
+    )
+    return messages
 
 
 def _build_graph(graph_factory, units) -> SemanticGraph:
@@ -816,3 +840,212 @@ def test_search_graph_relations_reads_the_relation_type_index(
     # An unfiltered lookup returns every indexed edge, with no retriever needed.
     assert len(graph.search_graph_relations(limit=10)) == 4
     assert calls[-1] is None
+
+
+def test_fallback_policy_default_keeps_degenerate_candidate_set(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    planner = ConstraintAwarePlanner(graph)
+    # speaker_c -> {u4} and s-work -> {u2, u5} share no unit.
+    constraints = QueryConstraints(
+        metadata_filters={"speaker": {"eq": "speaker_c"}},
+        space_names=["s-work"],
+    )
+
+    candidate_set = planner.resolve_candidates(constraints)
+
+    assert len(candidate_set) == 0
+
+
+def test_fallback_policy_drop_constraint_relaxes_to_the_largest_intersection(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    planner = ConstraintAwarePlanner(
+        graph, fallback_policy=FallbackPolicy(DROP_CONSTRAINT)
+    )
+    constraints = QueryConstraints(
+        metadata_filters={"speaker": {"eq": "speaker_c"}},
+        space_names=["s-work"],
+    )
+
+    warnings = _spy_on_planner_warnings(monkeypatch)
+    candidate_set = planner.resolve_candidates(constraints)
+
+    # Dropping the more restrictive metadata leaf ({u4}) leaves the larger space
+    # set, so that is the predicate the policy gives up.
+    assert candidate_set.uids == {"u2", "u5"}
+    assert any("metadata_filters" in message for message in warnings)
+
+
+def test_fallback_policy_never_drops_the_last_constraint(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    planner = ConstraintAwarePlanner(
+        graph, fallback_policy=FallbackPolicy(DROP_CONSTRAINT)
+    )
+    constraints = QueryConstraints(metadata_filters={"speaker": {"eq": "nobody"}})
+
+    # A genuinely unmatched single predicate still yields its empty set rather
+    # than silently becoming an unconstrained query.
+    assert len(planner.resolve_candidates(constraints)) == 0
+
+
+def test_fallback_policy_min_candidates_drops_repeatedly(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_relation_graph(graph_factory)
+    planner = ConstraintAwarePlanner(
+        graph, fallback_policy=FallbackPolicy(DROP_CONSTRAINT, min_candidates=2)
+    )
+    constraints = QueryConstraints(
+        metadata_filters={"speaker": {"eq": "speaker_a"}},
+        space_names=["s-work"],
+        relation=RelationConstraint(seed_uids=["u1"]),
+    )
+
+    warnings = _spy_on_planner_warnings(monkeypatch)
+    candidate_set = planner.resolve_candidates(constraints)
+
+    assert len(candidate_set) >= 2
+    assert sum("dropped constraint" in message for message in warnings) >= 2
+
+
+def test_plan_records_mode_reason(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    planner = ConstraintAwarePlanner(graph)
+
+    assert planner.plan(QueryConstraints(), top_k=5).mode_reason == "no_constraints"
+
+    selective = QueryConstraints(metadata_filters={"speaker": {"eq": "speaker_c"}})
+    selective_plan = planner.plan(selective, top_k=5)
+    assert selective_plan.mode == "pre_filter"
+    assert selective_plan.mode_reason == "selective_below_threshold"
+
+    broad = QueryConstraints(metadata_filters={"speaker": {"eq": "speaker_a"}})
+    broad_plan = planner.plan(broad, top_k=5)
+    assert broad_plan.mode == "post_filter"
+    assert broad_plan.mode_reason == "broad_above_threshold"
+
+
+def test_post_filter_pool_scales_with_selectivity(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    planner = ConstraintAwarePlanner(graph)
+    # A quarter of a 1000-unit corpus: filling top_k=20 needs ~80 fused results,
+    # more than the baseline max(top_k * 3, 50) expansion.
+    candidate_set = CandidateSet(
+        frozenset(str(index) for index in range(250)), source="meta", total=1000
+    )
+
+    assert planner._retrieval_top_k(20, candidate_set, "post_filter") == 80
+    # The pre-filter path already restricts retrieval, so it keeps the baseline.
+    assert planner._retrieval_top_k(20, candidate_set, "pre_filter") == 60
+    assert planner._retrieval_top_k(20, None, "none") == 20
+
+
+def test_search_constrained_accepts_fallback_policy(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    constraints = QueryConstraints(
+        metadata_filters={"speaker": {"eq": "speaker_c"}},
+        space_names=["s-work"],
+    )
+
+    relaxed = graph.search_constrained(
+        "coffee",
+        constraints,
+        top_k=5,
+        methods=["cosine_similarity"],
+        fallback_policy=FallbackPolicy(DROP_CONSTRAINT),
+    )
+
+    assert relaxed
+    assert all(unit.uid in {"u2", "u5"} for unit in relaxed)
+
+
+class _StubGraphRetriever:
+    """Records the node-search dispatch performed by ``search_graph_nodes``."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def _semantic_node_search(self, query, top_k, **kwargs):
+        self.calls.append(("semantic", query, top_k, kwargs))
+        return ["semantic-result"]
+
+    def _fulltext_node_search(self, query, top_k, **kwargs):
+        self.calls.append(("fulltext", query, top_k, kwargs))
+        return ["fulltext-result"]
+
+    def _hybrid_node_search(self, query, top_k, **kwargs):
+        self.calls.append(("hybrid", query, top_k, kwargs))
+        return ["hybrid-result"]
+
+
+class _StubRetrieverRegistry:
+    """Minimal stand-in exposing only the retrievers mapping."""
+
+    def __init__(self, retriever) -> None:
+        self.retrievers = {RetrievalMethod.GRAPH_TRAVERSAL: retriever}
+
+
+def test_search_graph_nodes_dispatches_to_existing_retriever_methods(
+    graph_factory, monkeypatch
+) -> None:
+    """The facade must call the methods ``GraphRetriever`` actually defines.
+
+    Before the fix every branch raised: ``RetrievalMethod`` is imported only
+    under ``TYPE_CHECKING`` (runtime ``NameError``) and the three dispatch
+    targets were misnamed (``hybrid_node_search`` etc.).
+    """
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    stub = _StubGraphRetriever()
+    monkeypatch.setattr(
+        graph, "get_multi_retriever", lambda: _StubRetrieverRegistry(stub)
+    )
+
+    assert graph.search_graph_nodes("q", top_k=2, search_method="semantic") == [
+        "semantic-result"
+    ]
+    assert graph.search_graph_nodes("q", top_k=2, search_method="fulltext") == [
+        "fulltext-result"
+    ]
+    assert graph.search_graph_nodes("q", top_k=3, search_method="hybrid") == [
+        "hybrid-result"
+    ]
+    # An unknown method still falls back to the hybrid path.
+    assert graph.search_graph_nodes("q", top_k=3, search_method="other") == [
+        "hybrid-result"
+    ]
+
+    assert [call[0] for call in stub.calls] == [
+        "semantic",
+        "fulltext",
+        "hybrid",
+        "hybrid",
+    ]
+    assert stub.calls[2][2] == 3
+
+
+def test_get_node_neighbors_resolves_retrieval_method(
+    graph_factory, monkeypatch
+) -> None:
+    """The delegation must not fail on the lazily imported ``RetrievalMethod``.
+
+    ``GraphRetriever`` does not implement ``get_relevant_nodes``, so the stub
+    supplies it: this pins the facade's own import and result hand-off, which is
+    what the ``NameError`` used to break before any call could be made.
+    """
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    unit = graph.get_unit("u1")
+
+    class _StubNeighborRetriever:
+        def get_relevant_nodes(self, seed_nodes, **kwargs):
+            return {"u1": [unit]}
+
+    monkeypatch.setattr(
+        graph,
+        "get_multi_retriever",
+        lambda: _StubRetrieverRegistry(_StubNeighborRetriever()),
+    )
+
+    neighbors = graph.get_node_neighbors("u1")
+
+    assert neighbors["all_neighbors"] == [unit]

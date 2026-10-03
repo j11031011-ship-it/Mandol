@@ -15,9 +15,9 @@ import rustworkx as rx
 # from .retrieval_interface import RetrievalMethod
 
 if TYPE_CHECKING:
+    from ..constraints.fallback import FallbackPolicy
     from ..constraints.query_constraints import QueryConstraints
     from ..retrieval.advance_retriever import MultiRetriever
-    from ..retrieval.retrieval_interface import RetrievalMethod
     from ..storage.rocksdb_payload_store import RocksDBPayloadStore
 
 from .semantic_map import SemanticMap
@@ -1118,6 +1118,8 @@ class SemanticGraph:
         constraints: Optional["QueryConstraints"] = None,
         top_k: int = 10,
         return_score: bool = False,
+        prefilter_selectivity_threshold: Optional[float] = None,
+        fallback_policy: Optional["FallbackPolicy"] = None,
         **kwargs,
     ) -> Union[List[MemoryUnit], List[Tuple[MemoryUnit, float]]]:
         """Run constraint-aware hybrid retrieval over the graph layer.
@@ -1138,6 +1140,10 @@ class SemanticGraph:
             top_k: Number of results to return after filtering.
             return_score: Whether to return ``(unit, score)`` tuples instead of
                 bare memory units.
+            prefilter_selectivity_threshold: Override the candidate fraction
+                below which ``candidate_uids`` is pushed down.
+            fallback_policy: Override how degenerate (empty or too small)
+                candidate sets are handled.
             **kwargs: Additional ``MultiRetriever.smart_search`` options such as
                 ``methods`` or ``fusion_method``.
 
@@ -1145,10 +1151,21 @@ class SemanticGraph:
             Ranked memory units (or ``(unit, score)`` tuples) satisfying every
             declared constraint.
         """
-        from ..constraints.planner import ConstraintAwarePlanner
+        from ..constraints.planner import (
+            DEFAULT_PREFILTER_SELECTIVITY_THRESHOLD,
+            ConstraintAwarePlanner,
+        )
         from ..constraints.query_constraints import QueryConstraints
 
-        planner = ConstraintAwarePlanner(self)
+        planner = ConstraintAwarePlanner(
+            self,
+            prefilter_selectivity_threshold=(
+                DEFAULT_PREFILTER_SELECTIVITY_THRESHOLD
+                if prefilter_selectivity_threshold is None
+                else prefilter_selectivity_threshold
+            ),
+            fallback_policy=fallback_policy,
+        )
         results = planner.execute_query(
             query_text,
             constraints if constraints is not None else QueryConstraints(),
@@ -1176,6 +1193,11 @@ class SemanticGraph:
             Ranked memory units and scores, or dense-search results when the
             graph retriever is unavailable.
         """
+        # Local import mirrors the other runtime uses in this module: the
+        # retrieval package is imported lazily to keep the core import graph
+        # acyclic.
+        from ..retrieval.retrieval_interface import RetrievalMethod
+
         multi_retriever = self.get_multi_retriever()
         if not multi_retriever:
             logger.warning("MultiRetriever is unavailable.")
@@ -1187,14 +1209,12 @@ class SemanticGraph:
         
         graph_retriever = multi_retriever.retrievers[RetrievalMethod.GRAPH_TRAVERSAL]
         
-        if search_method == "hybrid":
-            return graph_retriever.hybrid_node_search(query, top_k, **kwargs)
-        elif search_method == "semantic":
-            return graph_retriever._node_similarity_search(query, top_k, **kwargs)
+        if search_method == "semantic":
+            return graph_retriever._semantic_node_search(query, top_k, **kwargs)
         elif search_method == "fulltext":
-            return graph_retriever._node_fulltext_search(query, top_k, **kwargs)
+            return graph_retriever._fulltext_node_search(query, top_k, **kwargs)
         else:
-            return graph_retriever.hybrid_node_search(query, top_k, **kwargs)
+            return graph_retriever._hybrid_node_search(query, top_k, **kwargs)
 
     def get_edges_by_relation_types(
         self,
@@ -1276,7 +1296,17 @@ class SemanticGraph:
 
         Semantic neighbors come from similarity search over the node content.
         Structural neighbors come from graph traversal up to ``max_depth``.
+
+        Warning:
+            ``GraphRetriever`` does not implement ``get_relevant_nodes``, so the
+            delegation below cannot complete today; the ``semantic`` /
+            ``structural`` splits are never populated.
         """
+        # Local import mirrors the other runtime uses in this module: the
+        # retrieval package is imported lazily to keep the core import graph
+        # acyclic.
+        from ..retrieval.retrieval_interface import RetrievalMethod
+
         multi_retriever = self.get_multi_retriever()
         if not multi_retriever or RetrievalMethod.GRAPH_TRAVERSAL not in multi_retriever.retrievers:
             return {"semantic": [], "structural": []}

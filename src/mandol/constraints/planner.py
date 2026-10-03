@@ -6,17 +6,20 @@ semantics), and drives ``MultiRetriever.smart_search`` with the resulting
 execution plan. Selectivity decides how the candidate set reaches retrieval:
 sets covering less than the configured fraction of the corpus are pushed down
 as the ``candidate_uids`` pre-filter, while broad sets are applied to fused
-results afterwards (post-filter). The scheduling milestone (P3) builds on the
-same explicit ``mode`` field.
+results afterwards (post-filter). The post-filter pool then scales with
+selectivity so ``top_k`` can still be filled, and a configurable
+``FallbackPolicy`` decides what happens when the intersection is degenerate.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from ..utils.logging_config import create_module_logger
 from .candidate_set import CandidateSet
+from .fallback import FallbackPolicy
 from .query_constraints import QueryConstraints
 from .resolvers import (
     BaseConstraintResolver,
@@ -45,6 +48,16 @@ def _expand_top_k(top_k: int) -> int:
     return max(top_k * 3, 50)
 
 
+def _intersect_all(candidate_sets: Sequence[CandidateSet]) -> Optional[CandidateSet]:
+    """Intersect the given candidate sets, or return ``None`` when there are none."""
+    if not candidate_sets:
+        return None
+    combined = candidate_sets[0]
+    for candidate in candidate_sets[1:]:
+        combined = combined.intersect(candidate)
+    return combined
+
+
 @dataclass(frozen=True)
 class ConstraintExecutionPlan:
     """Execution plan assembled by ``ConstraintAwarePlanner.plan``.
@@ -56,11 +69,14 @@ class ConstraintExecutionPlan:
             ``candidate_uids`` retrieval filter, ``"post_filter"`` when it is
             applied to fused results, or ``"none"`` for unconstrained queries.
         retrieval_top_k: Pool size requested from ``smart_search``.
+        mode_reason: Human-readable justification for ``mode``, kept for
+            diagnostics and the benchmark report.
     """
 
     candidate_set: Optional[CandidateSet]
     mode: str
     retrieval_top_k: int
+    mode_reason: str = ""
 
 
 class ConstraintAwarePlanner:
@@ -76,6 +92,7 @@ class ConstraintAwarePlanner:
         self,
         semantic_graph: "SemanticGraph",
         prefilter_selectivity_threshold: float = DEFAULT_PREFILTER_SELECTIVITY_THRESHOLD,
+        fallback_policy: Optional[FallbackPolicy] = None,
     ):
         """Initialize the planner.
 
@@ -85,9 +102,12 @@ class ConstraintAwarePlanner:
             prefilter_selectivity_threshold: Candidate fraction below which the
                 plan pushes ``candidate_uids`` down into retrieval instead of
                 post-filtering fused results.
+            fallback_policy: Degenerate-candidate handling; defaults to keeping
+                the degenerate set (so an unsatisfiable query returns nothing).
         """
         self.semantic_graph = semantic_graph
         self.prefilter_selectivity_threshold = float(prefilter_selectivity_threshold)
+        self.fallback_policy = fallback_policy or FallbackPolicy()
 
     def _build_resolvers(
         self, constraints: QueryConstraints
@@ -116,6 +136,9 @@ class ConstraintAwarePlanner:
     def resolve_candidates(self, constraints: QueryConstraints) -> Optional[CandidateSet]:
         """Resolve every leaf constraint and intersect the results.
 
+        When the intersection is degenerate, ``fallback_policy`` decides whether
+        to keep it (the default) or to relax the query by dropping predicates.
+
         Returns:
             The intersected candidate set, or ``None`` when the query declares
             no constraints.
@@ -124,14 +147,87 @@ class ConstraintAwarePlanner:
         if not resolvers:
             return None
 
-        combined: Optional[CandidateSet] = None
-        for resolver in resolvers:
-            resolved = resolver.resolve()
+        resolved = [(resolver.source, resolver.resolve()) for resolver in resolvers]
+        for source, candidate in resolved:
             logger.debug(
-                "Constraint %s resolved %d candidates.", resolver.source, len(resolved)
+                "Constraint %s resolved %d candidates.", source, len(candidate)
             )
-            combined = resolved if combined is None else combined.intersect(resolved)
-        return combined
+
+        combined = _intersect_all([candidate for _, candidate in resolved])
+        return self._apply_fallback(combined, resolved)
+
+    def _apply_fallback(
+        self,
+        combined: CandidateSet,
+        resolved: Sequence[Tuple[str, CandidateSet]],
+    ) -> CandidateSet:
+        """Relax a degenerate candidate set by dropping the most restrictive leaf.
+
+        Predicates are dropped one at a time — always the one whose removal
+        leaves the largest intersection — until the set is no longer degenerate.
+        The last predicate is never dropped, so a genuinely unmatched single
+        predicate still yields its (possibly empty) set rather than silently
+        turning the query into an unconstrained one.
+        """
+        policy = self.fallback_policy
+        if (
+            len(combined) >= policy.min_candidates
+            or not policy.relaxes_degenerate_queries
+        ):
+            return combined
+
+        remaining = list(resolved)
+        relaxed = combined
+        while len(relaxed) < policy.min_candidates and len(remaining) > 1:
+            drop_index, candidate = self._most_relaxing_drop(remaining)
+            dropped_source = remaining[drop_index][0]
+            remaining.pop(drop_index)
+            logger.warning(
+                "Fallback policy dropped constraint '%s': %d candidate(s) is "
+                "below min_candidates=%d; relaxed set holds %d candidate(s).",
+                dropped_source,
+                len(relaxed),
+                policy.min_candidates,
+                len(candidate),
+            )
+            relaxed = candidate
+        return relaxed
+
+    @staticmethod
+    def _most_relaxing_drop(
+        remaining: Sequence[Tuple[str, CandidateSet]],
+    ) -> Tuple[int, CandidateSet]:
+        """Return the index whose removal yields the largest intersection."""
+        best_index, best_set = 0, None
+        for index in range(len(remaining)):
+            others = [
+                candidate
+                for position, (_, candidate) in enumerate(remaining)
+                if position != index
+            ]
+            candidate = _intersect_all(others)
+            if best_set is None or len(candidate) > len(best_set):
+                best_index, best_set = index, candidate
+        return best_index, best_set
+
+    def _retrieval_top_k(
+        self, top_k: int, candidate_set: Optional[CandidateSet], mode: str
+    ) -> int:
+        """Return the retrieval pool size for the planned query.
+
+        Post-filtering discards non-candidate units from the fused pool, so the
+        pool must hold enough survivors: with selectivity ``s``, roughly ``s`` of
+        the pool survives, so about ``top_k / s`` fused results are needed to fill
+        ``top_k``. The pre-filter path already restricts retrieval to candidates
+        and keeps the baseline expansion.
+        """
+        if candidate_set is None:
+            return top_k
+        pool = _expand_top_k(top_k)
+        selectivity = candidate_set.selectivity if mode == "post_filter" else None
+        if selectivity:
+            pool = max(pool, math.ceil(top_k / selectivity))
+        return pool
 
     def plan(self, constraints: QueryConstraints, top_k: int) -> ConstraintExecutionPlan:
         """Assemble the execution plan for one constrained query.
@@ -145,19 +241,25 @@ class ConstraintAwarePlanner:
         candidate_set = self.resolve_candidates(constraints)
         if candidate_set is None:
             return ConstraintExecutionPlan(
-                candidate_set=None, mode="none", retrieval_top_k=top_k
+                candidate_set=None,
+                mode="none",
+                retrieval_top_k=top_k,
+                mode_reason="no_constraints",
             )
+
         selectivity = candidate_set.selectivity
-        mode = (
-            "pre_filter"
-            if selectivity is not None
-            and selectivity < self.prefilter_selectivity_threshold
-            else "post_filter"
-        )
+        if selectivity is None:
+            mode, reason = "post_filter", "selectivity_unknown"
+        elif selectivity < self.prefilter_selectivity_threshold:
+            mode, reason = "pre_filter", "selective_below_threshold"
+        else:
+            mode, reason = "post_filter", "broad_above_threshold"
+
         return ConstraintExecutionPlan(
             candidate_set=candidate_set,
             mode=mode,
-            retrieval_top_k=_expand_top_k(top_k),
+            retrieval_top_k=self._retrieval_top_k(top_k, candidate_set, mode),
+            mode_reason=reason,
         )
 
     def execute_query(
