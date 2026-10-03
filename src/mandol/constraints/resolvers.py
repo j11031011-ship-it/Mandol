@@ -1,20 +1,22 @@
 """Constraint resolvers: leaf predicates evaluated into candidate sets.
 
-P0 ships the linear-scan resolver family. Every resolver answers the same
-question — "which UIDs satisfy this leaf constraint?" — so the planner can
-combine them with set algebra without knowing how each predicate is evaluated.
-The metadata index (P1) and the graph BFS resolver (P2) will plug into the same
-``BaseConstraintResolver.resolve`` contract, replacing the scans without
-touching the planner or the retrieval backends.
+Every resolver answers the same question — "which UIDs satisfy this leaf
+constraint?" — so the planner can combine them with set algebra without knowing
+how each predicate is evaluated. Metadata and time predicates consult the
+per-field indexes registered on ``SemanticMap`` (P1) and fall back to the
+linear-scan implementation whenever a field or operator is not servable; the
+graph BFS resolver (P2) walks ``SemanticGraph.rx_graph`` directly. All of them
+share the same ``BaseConstraintResolver.resolve`` contract, so the planner and
+the retrieval backends stay unaware of how a predicate is evaluated.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from .candidate_set import CandidateSet
-from .query_constraints import TimeRange
+from .query_constraints import RelationConstraint, TimeRange
 
 if TYPE_CHECKING:
     from ..core.memory_unit import MemoryUnit
@@ -100,10 +102,10 @@ class BaseConstraintResolver(ABC):
     def _l1_units(self) -> List["MemoryUnit"]:
         """Return L1-resident payloads.
 
-        Candidate resolution currently scans the same population as
-        ``filter_memory_units`` (L1 payloads only); paging cold records in is
-        deliberately left to the index milestone instead of materializing the
-        whole corpus per query.
+        Candidate resolution observes the same population as
+        ``filter_memory_units`` (L1 payloads only); the metadata index mirrors
+        that population rather than paging cold records in, so scans and index
+        lookups stay interchangeable and neither materializes the corpus.
         """
         return list(self.semantic_map.memory_units.values())
 
@@ -113,7 +115,12 @@ class BaseConstraintResolver(ABC):
 
 
 class MetadataConstraintResolver(BaseConstraintResolver):
-    """Linear-scan resolver for metadata field conditions (P0)."""
+    """Metadata field-condition resolver: index-backed, scan otherwise.
+
+    ``resolve`` first asks the map's ``MetadataIndex``; the index returns
+    ``None`` unless every field is registered and every operator is servable,
+    in which case the linear scan below runs with exactly the P0 semantics.
+    """
 
     source = "metadata_filters"
 
@@ -125,7 +132,7 @@ class MetadataConstraintResolver(BaseConstraintResolver):
         """Initialize the resolver.
 
         Args:
-            semantic_map: Map providing the unit population.
+            semantic_map: Map providing the unit population and the metadata index.
             filters: Field conditions using the ``filter_memory_units``
                 operator vocabulary.
         """
@@ -133,6 +140,25 @@ class MetadataConstraintResolver(BaseConstraintResolver):
         self.filters = filters
 
     def resolve(self) -> CandidateSet:
+        """Resolve the field conditions, preferring the registered index."""
+        indexed = self._resolve_via_index()
+        if indexed is not None:
+            return indexed
+        return self._resolve_via_scan()
+
+    def _resolve_via_index(self) -> Optional[CandidateSet]:
+        """Answer the filters from the map's metadata index when servable."""
+        metadata_index = getattr(self.semantic_map, "_metadata_index", None)
+        if metadata_index is None:
+            return None
+        resolved = metadata_index.lookup(self.filters)
+        if resolved is None:
+            return None
+        return CandidateSet.from_iterable(
+            resolved.uids, source=self.source, total=self._total_units()
+        )
+
+    def _resolve_via_scan(self) -> CandidateSet:
         """Scan L1 payloads and return the UIDs matching every field condition."""
         total = self._total_units()
         uids: Set[str] = {
@@ -144,11 +170,12 @@ class MetadataConstraintResolver(BaseConstraintResolver):
 
 
 class TimeRangeConstraintResolver(MetadataConstraintResolver):
-    """Linear-scan resolver for inclusive time windows (P0).
+    """Time-window resolver with a sorted-epoch fast path (P1).
 
-    The range is expressed as ``gte`` / ``lte`` conditions on the range field
-    and evaluated with the metadata scan. P1 replaces the scan with the sorted
-    epoch index while keeping this class name and contract.
+    The range is expressed as ``gte`` / ``lte`` conditions on the range field.
+    When the field is registered as a sorted index and both bounds normalize,
+    the lookup is a bisect over epoch floats; otherwise the inherited metadata
+    scan keeps the raw comparison semantics.
     """
 
     source = "time_range"
@@ -199,3 +226,104 @@ class SpaceConstraintResolver(BaseConstraintResolver):
             source=self.source,
             total=self._total_units(),
         )
+
+
+class RelationConstraintResolver(BaseConstraintResolver):
+    """Resolve a graph-neighborhood constraint with a depth-limited BFS (P2).
+
+    The resolver walks ``SemanticGraph.rx_graph`` directly instead of the legacy
+    graph helpers ``search_graph_relations(seed_nodes=...)`` /
+    ``get_node_neighbors``: those call ``GraphRetriever`` methods that do not
+    exist and raise ``AttributeError`` at runtime, and they return edge lists
+    rather than the node set a predicate needs. Starting from the seed UIDs it
+    follows edges up to ``max_depth`` hops in the requested direction, only
+    across the declared ``relation_types`` when given, and returns the reached
+    memory-unit UIDs — the neighborhood predicate becomes a candidate set
+    isomorphic to the metadata/time/space predicates.
+
+    The seeds are excluded from the result: the constraint describes the
+    neighborhood of the seeds ("neighbors of an entity"), not the seeds. The
+    traversal may pass through memory-space nodes (``ms:`` prefixed) to reach
+    further units, but those nodes are never returned because only memory units
+    are retrievable.
+    """
+
+    source = "relation"
+
+    def __init__(self, semantic_map: "SemanticMap", relation: RelationConstraint):
+        """Initialize the resolver.
+
+        Args:
+            semantic_map: Map whose parent graph owns the adjacency and the
+                UID/node-index mapping used by the traversal.
+            relation: Neighborhood predicate (seeds, depth, relation types,
+                direction).
+        """
+        super().__init__(semantic_map)
+        self.relation = relation
+
+    def resolve(self) -> CandidateSet:
+        """Return the memory-unit UIDs reachable from the seed UIDs."""
+        graph = getattr(self.semantic_map, "_parent_semantic_graph", None)
+        total = self._total_units()
+        if graph is None:
+            return CandidateSet.from_iterable((), source=self.source, total=total)
+
+        uid_to_index = graph._uid_to_index
+        index_to_uid = graph._index_to_uid
+        relation_types = (
+            set(self.relation.relation_types) if self.relation.relation_types else None
+        )
+        # Seeds start visited so they never enter the result and a seed reached
+        # as another seed's neighbor is not reported either.
+        visited: Set[str] = {
+            uid for uid in self.relation.seed_uids if uid in uid_to_index
+        }
+        frontier = set(visited)
+        neighbors: Set[str] = set()
+        for _ in range(max(int(self.relation.max_depth), 0)):
+            next_frontier: Set[str] = set()
+            for uid in frontier:
+                for neighbor_idx in self._iter_neighbor_indices(
+                    graph.rx_graph,
+                    uid_to_index[uid],
+                    self.relation.direction,
+                    relation_types,
+                ):
+                    neighbor_uid = index_to_uid.get(neighbor_idx)
+                    if not neighbor_uid or neighbor_uid in visited:
+                        continue
+                    visited.add(neighbor_uid)
+                    next_frontier.add(neighbor_uid)
+                    if not neighbor_uid.startswith("ms:"):
+                        neighbors.add(neighbor_uid)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return CandidateSet.from_iterable(neighbors, source=self.source, total=total)
+
+    @staticmethod
+    def _iter_neighbor_indices(
+        rx_graph: Any,
+        node_idx: int,
+        direction: str,
+        relation_types: Optional[Set[str]],
+    ) -> Iterator[int]:
+        """Yield neighbor node indices honoring direction and relation types.
+
+        ``out_edges`` yields ``(parent, child, data)`` and ``in_edges`` yields
+        the same tuple shape, so the neighbor is the endpoint that is not
+        ``node_idx``. Untyped edges are treated as relations only when no type
+        filter is requested.
+        """
+        edges: List[Tuple[int, int, Any]] = []
+        if direction in ("successors", "both"):
+            edges.extend(rx_graph.out_edges(node_idx))
+        if direction in ("predecessors", "both"):
+            edges.extend(rx_graph.in_edges(node_idx))
+        for src_idx, tgt_idx, edge_data in edges:
+            if relation_types is not None and (
+                not edge_data or edge_data.get("type") not in relation_types
+            ):
+                continue
+            yield tgt_idx if src_idx == node_idx else src_idx

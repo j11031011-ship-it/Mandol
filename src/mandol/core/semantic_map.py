@@ -2,7 +2,7 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Set, Tuple, Union, Iterable
+from typing import Dict, Any, Optional, List, Set, Tuple, Union, Iterable, Mapping
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -15,6 +15,7 @@ from .memory_unit import MemoryUnit
 from .memory_space import MemorySpace
 from .siliconflow_embedding_adapter import SiliconFlowEmbeddingAdapter
 from ..retrieval.retrieval_interface import MultiRetrievalInterface, RetrievalInterface
+from ..indexes.metadata_index import MetadataIndex
 from ..utils.config_manager import settings
 from ..utils.model_manager import global_model_manager
 from ..utils.logging_config import create_module_logger
@@ -426,6 +427,7 @@ class SemanticMap(RetrievalInterface):
         self._high_level_memory_build_state: Dict[str, Any] = {}
         self._space_membership_version = 0
         self._space_filter_cache: Dict[Tuple[Tuple[str, ...], int], np.ndarray] = {}
+        self._metadata_index = MetadataIndex()
 
         self._multi_retriever = None
         
@@ -479,6 +481,24 @@ class SemanticMap(RetrievalInterface):
         """Invalidate cached MemorySpace -> FAISS int-id filters."""
         self._space_membership_version += 1
         self._space_filter_cache.clear()
+
+    def register_filterable_fields(
+        self, fields: Union[Iterable[str], Mapping[str, str]]
+    ) -> None:
+        """Register payload fields for indexed constraint resolution.
+
+        Bare field names register equality (hash) indexes; a mapping selects the
+        strategy per field (``"hash"`` for ``eq`` / ``in`` / ``ne`` / ``nin``,
+        ``"sorted"`` for normalized ordering such as time ranges). Registration
+        indexes the current L1 population, and later insertions, deletions, and
+        tiered paging keep the indexes in sync. Unregistered fields keep the
+        linear-scan resolver path, so behavior is unchanged without opt-in.
+
+        Args:
+            fields: Field names, or a mapping from field name to strategy kind.
+        """
+        self._metadata_index.register_fields(fields)
+        self._metadata_index.rebuild(self.memory_units.values())
 
     def _get_or_create_int_id(self, uid: str) -> int:
         """Return the stable global int_id for uid, allocating one if this is a new UID."""
@@ -634,9 +654,11 @@ class SemanticMap(RetrievalInterface):
             return 0
 
         removed_count = 0
+        evicted_uids: List[str] = []
         for uid in uids:
             if uid in self.memory_units:
                 del self.memory_units[uid]
+                evicted_uids.append(uid)
                 removed_count += 1
             self._modified_units.discard(uid)
             self._access_counts.pop(uid, None)
@@ -644,6 +666,7 @@ class SemanticMap(RetrievalInterface):
             if self._storage_uids is not None:
                 self._storage_uids.add(uid)
 
+        self._metadata_index.remove_units(evicted_uids)
         if removed_count:
             logger.info(
                 "Tiered storage evicted %d payloads; indexes, UID mappings, "
@@ -666,6 +689,7 @@ class SemanticMap(RetrievalInterface):
             self._access_counts[unit.uid] = self._access_counts.get(unit.uid, 0) + 1
             self._last_accessed[unit.uid] = now
 
+        self._metadata_index.add_units(recovered_units)
         self._trigger_tiered_eviction_if_needed()
         return len(recovered_units)
 
@@ -1350,6 +1374,8 @@ class SemanticMap(RetrievalInterface):
         unit.embedding = new_embedding
 
         self.memory_units[unit.uid] = unit
+        # Constraint indexes track L1 unconditionally, independent of index_update_mode.
+        self._metadata_index.add_units((unit,))
         logger.info(f"Memory unit '{unit.uid}' has been added or updated in SemanticMap.")
 
         if space_names:
@@ -1604,6 +1630,7 @@ class SemanticMap(RetrievalInterface):
         
         
         all_added_units = [unit for unit, _ in units_to_process] + units_no_text
+        self._metadata_index.add_units(all_added_units)
         self._apply_index_update_mode(all_added_units, index_update_mode)
         self._trigger_tiered_eviction_if_needed()
         
@@ -1841,6 +1868,7 @@ class SemanticMap(RetrievalInterface):
             except Exception as e:
                 logger.error(f"Failed to remove unit '{uid}' from the FAISS index: {e}")
         self._remove_aux_retriever_uids([uid])
+        self._metadata_index.remove_units((uid,))
 
         logger.info(f"Memory unit '{uid}' deleted from SemanticMap")
         if rebuild_index_immediately:

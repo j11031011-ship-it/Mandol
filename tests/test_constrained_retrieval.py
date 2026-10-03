@@ -1,8 +1,11 @@
-"""Offline tests for constraint-aware hybrid retrieval (P0).
+"""Offline tests for constraint-aware hybrid retrieval (P0/P1/P2).
 
 The suite follows the offline paradigm of ``test_rocksdb_tiered_cache.py``:
 ``global_model_manager`` is patched with deterministic dummies and every test
-runs without network access or real model downloads.
+runs without network access or real model downloads. P1 additions cover the
+metadata-index fast paths, incremental index maintenance, and the
+selectivity-driven ``candidate_uids`` pre-filter push-down; P2 additions cover
+the graph-neighborhood BFS resolver over ``SemanticGraph.rx_graph``.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from mandol.constraints import (
     MetadataConstraintResolver,
     QueryConstraints,
     RelationConstraint,
+    RelationConstraintResolver,
     SpaceConstraintResolver,
     TimeRange,
     TimeRangeConstraintResolver,
@@ -241,12 +245,167 @@ def test_plan_post_filter_expands_pool_and_intersects_leaves(graph_factory) -> N
     assert plan.candidate_set.selectivity == pytest.approx(0.5)
 
 
-def test_relation_constraint_is_deferred_to_p2(graph_factory) -> None:
-    planner = ConstraintAwarePlanner(graph_factory())
-    constraints = QueryConstraints(relation=RelationConstraint(seed_uids=["u1"]))
+def _build_relation_graph(graph_factory) -> SemanticGraph:
+    """Build the default units plus a small explicit-relationship topology.
 
-    with pytest.raises(NotImplementedError):
-        planner.resolve_candidates(constraints)
+    Edges (all monodirectional unless noted): ``u1 -> u2`` (FOLLOWED_BY),
+    ``u1 -> u3`` (MENTION_OF), ``u4 -> u1`` (MENTION_OF), ``u2 -> u5`` (NEXT).
+    """
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    assert graph.add_relationship("u1", "u2", "FOLLOWED_BY")
+    assert graph.add_relationship("u1", "u3", "MENTION_OF")
+    assert graph.add_relationship("u4", "u1", "MENTION_OF")
+    assert graph.add_relationship("u2", "u5", "NEXT")
+    return graph
+
+
+def test_relation_resolver_one_hop_both_directions(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+
+    resolved = RelationConstraintResolver(
+        graph.semantic_map, RelationConstraint(seed_uids=["u1"])
+    ).resolve()
+
+    # Successors u2/u3 and predecessor u4; the seed u1 itself is excluded.
+    assert resolved.uids == {"u2", "u3", "u4"}
+    assert resolved.source == "relation"
+    assert resolved.total == len(DEFAULT_UNITS)
+
+
+def test_relation_resolver_honors_direction_and_depth(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+    semantic_map = graph.semantic_map
+
+    successors = RelationConstraintResolver(
+        semantic_map,
+        RelationConstraint(seed_uids=["u1"], direction="successors"),
+    ).resolve()
+    assert successors.uids == {"u2", "u3"}
+
+    predecessors = RelationConstraintResolver(
+        semantic_map,
+        RelationConstraint(seed_uids=["u1"], direction="predecessors"),
+    ).resolve()
+    assert predecessors.uids == {"u4"}
+
+    depth_two = RelationConstraintResolver(
+        semantic_map,
+        RelationConstraint(seed_uids=["u1"], max_depth=2, direction="successors"),
+    ).resolve()
+    # u5 is two hops away through u2.
+    assert depth_two.uids == {"u2", "u3", "u5"}
+
+
+def test_relation_resolver_filters_by_relation_type(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+
+    resolved = RelationConstraintResolver(
+        graph.semantic_map,
+        RelationConstraint(seed_uids=["u1"], relation_types=["MENTION_OF"]),
+    ).resolve()
+
+    assert resolved.uids == {"u3", "u4"}
+
+
+def test_relation_resolver_handles_unknown_and_multiple_seeds(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+    semantic_map = graph.semantic_map
+
+    # A seed that is absent from the graph contributes no neighborhood.
+    assert (
+        RelationConstraintResolver(
+            semantic_map,
+            RelationConstraint(seed_uids=["missing"], max_depth=2),
+        )
+        .resolve()
+        .uids
+        == frozenset()
+    )
+
+    # Seeds are excluded even when they are neighbors of one another.
+    resolved = RelationConstraintResolver(
+        semantic_map, RelationConstraint(seed_uids=["u1", "u2"])
+    ).resolve()
+    assert resolved.uids == {"u3", "u4", "u5"}
+
+
+def test_relation_resolver_excludes_memory_space_nodes(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    # Memory spaces are graph nodes; only retrievable memory units may enter the
+    # candidate set, so the reached space node is dropped.
+    assert graph.add_relationship("u1", "s-daily", "IN_SPACE")
+
+    resolved = RelationConstraintResolver(
+        graph.semantic_map, RelationConstraint(seed_uids=["u1"])
+    ).resolve()
+
+    assert resolved.uids == frozenset()
+
+
+def test_relation_resolver_without_parent_graph_returns_empty(graph_factory) -> None:
+    standalone_map = SemanticMap(
+        embedding_model_name="test/dummy",
+        embedding_dim=2,
+        use_flash_attention=False,
+    )
+
+    resolved = RelationConstraintResolver(
+        standalone_map, RelationConstraint(seed_uids=["u1"])
+    ).resolve()
+
+    assert resolved.uids == frozenset()
+
+
+def test_plan_intersects_relation_with_other_constraints(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+    planner = ConstraintAwarePlanner(graph)
+
+    constraints = QueryConstraints(
+        metadata_filters={"speaker": {"eq": "speaker_b"}},
+        relation=RelationConstraint(seed_uids=["u1"]),
+    )
+    plan = planner.plan(constraints, top_k=2)
+
+    # neighbors(u1) = {u2, u3, u4}; speaker_b among them is only u2.
+    assert plan.candidate_set.uids == {"u2"}
+    assert plan.mode == "pre_filter"
+
+
+def test_execute_query_with_relation_constraint_verifies_neighbors(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_relation_graph(graph_factory)
+    semantic_map = graph.semantic_map
+    stub = _StubMultiRetriever(
+        [
+            (semantic_map.get_unit("u2"), 0.9),
+            (semantic_map.get_unit("u1"), 0.8),
+            (semantic_map.get_unit("u5"), 0.7),
+        ]
+    )
+    monkeypatch.setattr(graph, "get_multi_retriever", lambda: stub)
+
+    planner = ConstraintAwarePlanner(graph)
+    constraints = QueryConstraints(relation=RelationConstraint(seed_uids=["u1"]))
+    results = planner.execute_query("coffee", constraints, top_k=3)
+
+    # u1 (the seed) and u5 (two hops away) violate the 1-hop constraint.
+    assert [unit.uid for unit, _ in results] == ["u2"]
+
+
+def test_search_constrained_combines_relation_and_metadata(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+    constraints = QueryConstraints(
+        metadata_filters={"speaker": {"eq": "speaker_b"}},
+        relation=RelationConstraint(seed_uids=["u1"]),
+    )
+
+    results = graph.search_constrained(
+        "coffee", constraints, top_k=5, methods=["cosine_similarity"]
+    )
+
+    # neighbors(u1) = {u2, u3, u4}; the only speaker_b neighbor is u2.
+    assert {unit.uid for unit in results} == {"u2"}
 
 
 def test_execute_query_post_filters_without_candidate_pushdown(
@@ -360,3 +519,233 @@ def test_search_constrained_returns_empty_for_unsatisfiable_constraints(
     constraints = QueryConstraints(metadata_filters={"speaker": {"eq": "speaker_z"}})
 
     assert graph.search_constrained("coffee", constraints) == []
+
+
+def _spy_index_lookup(monkeypatch, semantic_map) -> list:
+    """Record ``MetadataIndex.lookup`` calls while preserving behavior."""
+    calls: list = []
+    index = semantic_map._metadata_index
+    original_lookup = index.lookup
+
+    def counting_lookup(filters):
+        calls.append(filters)
+        return original_lookup(filters)
+
+    monkeypatch.setattr(index, "lookup", counting_lookup)
+    return calls
+
+
+def test_metadata_resolver_uses_registered_index(graph_factory, monkeypatch) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    semantic_map.register_filterable_fields({"speaker": "hash"})
+    calls = _spy_index_lookup(monkeypatch, semantic_map)
+
+    filters = {"speaker": {"in": ["speaker_a", "speaker_b"]}}
+    resolved = MetadataConstraintResolver(semantic_map, filters).resolve()
+    baseline = {
+        unit.uid
+        for unit in semantic_map.filter_memory_units(filter_condition=filters)
+    }
+
+    assert calls, "the registered field should be served by the metadata index"
+    assert resolved.uids == baseline == {"u1", "u2", "u3", "u5", "u6"}
+    assert resolved.total == len(DEFAULT_UNITS)
+
+
+def test_unregistered_fields_fall_back_to_linear_scan(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    semantic_map.register_filterable_fields(["speaker"])
+
+    filters = {"text_content": {"contain": "coffee"}}
+    resolved = MetadataConstraintResolver(semantic_map, filters).resolve()
+    baseline = {
+        unit.uid
+        for unit in semantic_map.filter_memory_units(filter_condition=filters)
+    }
+
+    assert resolved.uids == baseline == {"u1", "u3", "u5"}
+
+
+def test_time_range_resolver_uses_sorted_index(graph_factory, monkeypatch) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    semantic_map.register_filterable_fields({"timestamp": "sorted"})
+    calls = _spy_index_lookup(monkeypatch, semantic_map)
+
+    window = TimeRange(start="2024-02-01T00:00:00", end="2024-04-30T23:59:59")
+    resolved = TimeRangeConstraintResolver(semantic_map, window).resolve()
+    baseline = {
+        unit.uid
+        for unit in semantic_map.filter_memory_units(
+            filter_condition={"timestamp": {"gte": window.start, "lte": window.end}}
+        )
+    }
+
+    assert calls
+    assert resolved.uids == baseline == {"u2", "u3", "u4"}
+
+
+def test_index_maintenance_tracks_insertions_deletions_and_tiered_swap(
+    graph_factory,
+) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    semantic_map.register_filterable_fields(["speaker"])
+    filters = {"speaker": {"eq": "speaker_a"}}
+
+    extra = MemoryUnit("u7", {"text_content": "late coffee note", "speaker": "speaker_a"})
+    semantic_map.add_unit(
+        extra,
+        explicit_content_for_embedding="late coffee note",
+        space_names=["s-daily"],
+        generate_sparse_embedding=False,
+    )
+    assert MetadataConstraintResolver(semantic_map, filters).resolve().uids == {
+        "u1",
+        "u3",
+        "u6",
+        "u7",
+    }
+
+    semantic_map.delete_unit("u7")
+    assert MetadataConstraintResolver(semantic_map, filters).resolve().uids == {
+        "u1",
+        "u3",
+        "u6",
+    }
+
+    evicted = semantic_map.get_unit("u1")
+    assert semantic_map._remove_from_l1_for_tiered_swap(["u1"]) == 1
+    resolved = MetadataConstraintResolver(semantic_map, filters).resolve()
+    baseline = {
+        unit.uid
+        for unit in semantic_map.filter_memory_units(filter_condition=filters)
+    }
+    assert resolved.uids == baseline == {"u3", "u6"}
+    assert resolved.total == len(DEFAULT_UNITS) - 1
+
+    semantic_map._add_to_l1_from_tiered_swap([evicted])
+    assert MetadataConstraintResolver(semantic_map, filters).resolve().uids == {
+        "u1",
+        "u3",
+        "u6",
+    }
+
+
+def test_plan_prefilters_selective_candidates(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    planner = ConstraintAwarePlanner(graph)
+
+    selective = QueryConstraints(metadata_filters={"speaker": {"eq": "speaker_c"}})
+    plan = planner.plan(selective, top_k=2)
+    assert plan.mode == "pre_filter"
+    assert plan.candidate_set.uids == {"u4"}
+    assert plan.retrieval_top_k == 50
+
+    broad = QueryConstraints(space_names=["s-daily", "s-work"])
+    assert planner.plan(broad, top_k=2).mode == "post_filter"
+
+
+def test_execute_query_pushes_candidate_uids_when_prefiltering(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    stub = _StubMultiRetriever(
+        [(semantic_map.get_unit("u4"), 0.9), (semantic_map.get_unit("u1"), 0.8)]
+    )
+    monkeypatch.setattr(graph, "get_multi_retriever", lambda: stub)
+
+    planner = ConstraintAwarePlanner(graph)
+    constraints = QueryConstraints(metadata_filters={"speaker": {"eq": "speaker_c"}})
+    results = planner.execute_query("hiking", constraints, top_k=2)
+
+    # u1 violates the constraint and is verified out of the fused results.
+    assert [unit.uid for unit, _ in results] == ["u4"]
+    _, call_kwargs = stub.calls[0]
+    assert call_kwargs["candidate_uids"] == ["u4"]
+    assert call_kwargs["top_k"] == 50
+
+
+def test_execute_query_intersects_caller_candidates_on_pushdown(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    stub = _StubMultiRetriever([(semantic_map.get_unit("u4"), 0.9)])
+    monkeypatch.setattr(graph, "get_multi_retriever", lambda: stub)
+
+    planner = ConstraintAwarePlanner(graph)
+    constraints = QueryConstraints(metadata_filters={"speaker": {"eq": "speaker_c"}})
+
+    results = planner.execute_query(
+        "hiking", constraints, top_k=2, candidate_uids=["u4", "u0"]
+    )
+    assert [unit.uid for unit, _ in results] == ["u4"]
+    _, call_kwargs = stub.calls[0]
+    assert call_kwargs["candidate_uids"] == ["u4"]
+
+    stub.calls.clear()
+    assert (
+        planner.execute_query("hiking", constraints, top_k=2, candidate_uids=["u1"])
+        == []
+    )
+    assert stub.calls == []
+
+
+def test_execute_query_propagates_caller_candidates_on_post_filter(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    stub = _StubMultiRetriever(
+        [(semantic_map.get_unit("u6"), 0.9), (semantic_map.get_unit("u3"), 0.8)]
+    )
+    monkeypatch.setattr(graph, "get_multi_retriever", lambda: stub)
+
+    planner = ConstraintAwarePlanner(graph)
+    constraints = QueryConstraints(time_range=TimeRange(start="2024-03-01T00:00:00"))
+    assert planner.plan(constraints, top_k=2).mode == "post_filter"
+
+    results = planner.execute_query(
+        "coffee", constraints, top_k=2, candidate_uids=["u6", "u1"]
+    )
+    assert [unit.uid for unit, _ in results] == ["u6"]
+    _, call_kwargs = stub.calls[0]
+    # The caller filter is intersected with the constraints before push-down.
+    assert call_kwargs["candidate_uids"] == ["u6"]
+
+
+def test_search_constrained_prefilter_matches_post_filter_baseline(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    constraints = QueryConstraints(metadata_filters={"speaker": {"eq": "speaker_c"}})
+    top_k = 3
+
+    constrained = graph.search_constrained(
+        "weekend hiking",
+        constraints,
+        top_k=top_k,
+        return_score=True,
+        methods=["cosine_similarity"],
+    )
+
+    # Baseline: full retrieval, then the existing linear filter.
+    retriever = graph.get_multi_retriever()
+    baseline_pool = retriever.smart_search(
+        "weekend hiking", top_k=50, methods=["cosine_similarity"]
+    )
+    allowed = {
+        unit.uid
+        for unit in graph.semantic_map.filter_memory_units(
+            filter_condition={"speaker": {"eq": "speaker_c"}}
+        )
+    }
+    baseline = [
+        (unit, score) for unit, score in baseline_pool if unit.uid in allowed
+    ][:top_k]
+
+    assert constrained
+    assert [unit.uid for unit, _ in constrained] == [unit.uid for unit, _ in baseline]
+    assert [unit.uid for unit, _ in constrained] == ["u4"]

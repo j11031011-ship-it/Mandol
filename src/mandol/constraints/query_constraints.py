@@ -12,9 +12,10 @@ class TimeRange:
 
     The field defaults to ``timestamp`` because benchmark payloads store the
     observation time in ``raw_data["timestamp"]`` (for example LoCoMo episodic
-    units). Value normalization (multi-format strings to epoch floats) arrives
-    with the sorted index in P1; until then the raw values are compared with the
-    same operator semantics as ``SemanticMap.filter_memory_units``.
+    units). When the field is registered as a sorted index, bounds and values
+    are normalized to epoch floats by ``TimestampNormalizer`` and the window is
+    answered with bisect; otherwise the raw values are compared with the same
+    operator semantics as ``SemanticMap.filter_memory_units``.
 
     Attributes:
         start: Inclusive lower bound; ``None`` means unbounded below.
@@ -31,8 +32,8 @@ class TimeRange:
 class RelationConstraint:
     """Graph-neighborhood constraint over explicit relationships.
 
-    Declared with ``QueryConstraints`` so the public bundle stays stable; the
-    depth-limited BFS resolver over ``rx_graph`` lands with the P2 milestone.
+    Declared with ``QueryConstraints`` and resolved by the depth-limited BFS
+    resolver over ``SemanticGraph.rx_graph`` (``RelationConstraintResolver``).
     The default values describe the assignment's "neighbors of an entity" case:
     one hop from the seed units in both edge directions.
 

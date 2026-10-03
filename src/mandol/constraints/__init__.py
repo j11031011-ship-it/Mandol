@@ -11,10 +11,13 @@ fusion):
 - ``CandidateSet`` provides the UID set algebra that decouples predicates from
   retrieval;
 - ``ConstraintAwarePlanner`` coordinates resolution and retrieval and is reached
-  through ``SemanticGraph.search_constrained``.
+  through ``SemanticGraph.search_constrained``; selective candidate sets are
+  pushed down as the ``candidate_uids`` pre-filter and broader ones are applied
+  to fused results as a post-filter.
 
 All of it composes with the existing backends through the ``candidate_uids``
-parameter of ``BaseRetriever.search``; no retrieval backend is modified.
+parameter of ``BaseRetriever.search``; no retrieval backend is modified. The
+incrementally maintained index-backed fast paths live in ``mandol.indexes``.
 """
 
 from .candidate_set import CandidateSet
@@ -23,6 +26,7 @@ from .query_constraints import QueryConstraints, RelationConstraint, TimeRange
 from .resolvers import (
     BaseConstraintResolver,
     MetadataConstraintResolver,
+    RelationConstraintResolver,
     SpaceConstraintResolver,
     TimeRangeConstraintResolver,
 )
@@ -36,6 +40,7 @@ __all__ = [
     "TimeRange",
     "BaseConstraintResolver",
     "MetadataConstraintResolver",
+    "RelationConstraintResolver",
     "SpaceConstraintResolver",
     "TimeRangeConstraintResolver",
 ]

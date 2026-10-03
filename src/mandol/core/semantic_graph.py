@@ -1106,11 +1106,13 @@ class SemanticGraph:
         """Run constraint-aware hybrid retrieval over the graph layer.
 
         The facade delegates to ``ConstraintAwarePlanner``: every declared
-        constraint is resolved into a candidate UID set, the sets are
-        intersected (AND semantics), and fused retrieval results are
-        post-filtered against the intersection before ``top_k`` is applied.
-        The underlying retriever is not asked for a reduced candidate pool yet —
-        the ``candidate_uids`` pre-filter push-down is the next milestone.
+        constraint is resolved into a candidate UID set (index-backed when the
+        corresponding fields are registered through
+        ``SemanticMap.register_filterable_fields``), the sets are intersected
+        (AND semantics), and the intersection reaches retrieval as a
+        ``candidate_uids`` pre-filter when it is selective enough or as a
+        post-filter on fused results otherwise. Results are always verified
+        against the intersection before ``top_k`` is applied.
 
         Args:
             query_text: Query text passed to the underlying retriever.
@@ -1125,10 +1127,6 @@ class SemanticGraph:
         Returns:
             Ranked memory units (or ``(unit, score)`` tuples) satisfying every
             declared constraint.
-
-        Raises:
-            NotImplementedError: If a relation constraint is declared; the
-                depth-limited BFS resolver arrives with the P2 milestone.
         """
         from ..constraints.planner import ConstraintAwarePlanner
         from ..constraints.query_constraints import QueryConstraints
