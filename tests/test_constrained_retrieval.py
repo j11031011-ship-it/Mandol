@@ -5,7 +5,8 @@ The suite follows the offline paradigm of ``test_rocksdb_tiered_cache.py``:
 runs without network access or real model downloads. P1 additions cover the
 metadata-index fast paths, incremental index maintenance, and the
 selectivity-driven ``candidate_uids`` pre-filter push-down; P2 additions cover
-the graph-neighborhood BFS resolver over ``SemanticGraph.rx_graph``.
+the graph-neighborhood BFS resolver over ``SemanticGraph.rx_graph``; P2+
+additions cover maintenance of the relation-type inverted index.
 """
 
 from __future__ import annotations
@@ -749,3 +750,69 @@ def test_search_constrained_prefilter_matches_post_filter_baseline(graph_factory
     assert constrained
     assert [unit.uid for unit, _ in constrained] == [unit.uid for unit, _ in baseline]
     assert [unit.uid for unit, _ in constrained] == ["u4"]
+
+
+def test_relation_type_index_tracks_add_delete_and_unit_removal(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+    index = graph._relation_type_index
+
+    assert set(index.relation_types) == {"FOLLOWED_BY", "MENTION_OF", "NEXT"}
+    assert index.edge_count(["MENTION_OF"]) == 2
+
+    # Bidirectional relationships register both directions.
+    assert graph.add_relationship("u5", "u6", "SIBLING", bidirectional=True)
+    assert index.edge_count(["SIBLING"]) == 2
+
+    assert graph.delete_relationship("u1", "u3", "MENTION_OF") is True
+    assert index.edge_count(["MENTION_OF"]) == 1
+
+    # Deleting a unit drops every incident edge from the index.
+    graph.delete_unit("u2")
+    assert index.edge_count(["FOLLOWED_BY"]) == 0
+    assert index.edge_count(["NEXT"]) == 0
+    assert index.edge_count(["MENTION_OF"]) == 1  # u4 -> u1 survives
+
+
+def test_get_edges_by_relation_types_filters_and_limits(graph_factory) -> None:
+    graph = _build_relation_graph(graph_factory)
+
+    all_edges = graph.get_edges_by_relation_types()
+    assert len(all_edges) == 4
+    assert all(isinstance(attrs, dict) for _, _, attrs in all_edges)
+
+    mentions = graph.get_edges_by_relation_types(["MENTION_OF"])
+    assert {tuple(sorted((src, tgt))) for src, tgt, _ in mentions} == {
+        ("u1", "u3"),
+        ("u1", "u4"),
+    }
+    assert {attrs["type"] for _, _, attrs in mentions} == {"MENTION_OF"}
+
+    assert len(graph.get_edges_by_relation_types(limit=2)) == 2
+    assert graph.get_edges_by_relation_types(["MISSING"]) == []
+
+
+def test_search_graph_relations_reads_the_relation_type_index(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_relation_graph(graph_factory)
+
+    calls = []
+    original_lookup = graph._relation_type_index.lookup
+
+    def spy_lookup(relation_types=None):
+        calls.append(relation_types)
+        return original_lookup(relation_types)
+
+    monkeypatch.setattr(graph._relation_type_index, "lookup", spy_lookup)
+
+    edges = graph.search_graph_relations(relation_types=["MENTION_OF"], limit=10)
+    # The type-filtered path goes through the inverted index, not an edge scan.
+    assert calls == [["MENTION_OF"]]
+    assert {tuple(sorted((src, tgt))) for src, tgt, _ in edges} == {
+        ("u1", "u3"),
+        ("u1", "u4"),
+    }
+
+    # An unfiltered lookup returns every indexed edge, with no retriever needed.
+    assert len(graph.search_graph_relations(limit=10)) == 4
+    assert calls[-1] is None

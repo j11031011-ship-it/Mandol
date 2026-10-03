@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 from .semantic_map import SemanticMap
 from .memory_unit import MemoryUnit
 from .memory_space import MemorySpace
+from .relation_type_index import RelationTypeIndex
 from ..utils.logging_config import create_module_logger
 
 logger = create_module_logger("semantic_graph")
@@ -55,6 +56,10 @@ class SemanticGraph:
         # public UIDs and persists this bidirectional mapping with the graph.
         self._uid_to_index: Dict[str, int] = {}  
         self._index_to_uid: Dict[int, str] = {}  
+
+        # Derived inverted index over relation types; the rustworkx graph above
+        # remains the single source of truth (see RelationTypeIndex).
+        self._relation_type_index = RelationTypeIndex()
 
         logger.info("SemanticGraph initialized with the rustworkx backend.")
 
@@ -710,6 +715,9 @@ class SemanticGraph:
         src_idx = self._uid_to_index[src_id]
         tgt_idx = self._uid_to_index[tgt_id]
         self.rx_graph.add_edge(src_idx, tgt_idx, edge_attributes)
+        self._relation_type_index.add(
+            src_id, tgt_id, relationship_name, edge_attributes
+        )
 
         # Keep the external relationship cache in sync with the graph edge.
         self.swap_in_relationship(src_id, tgt_id, relationship_name, kwargs)
@@ -724,6 +732,9 @@ class SemanticGraph:
 
         if bidirectional:
             self.rx_graph.add_edge(tgt_idx, src_idx, edge_attributes)
+            self._relation_type_index.add(
+                tgt_id, src_id, relationship_name, edge_attributes
+            )
             self.swap_in_relationship(tgt_id, src_id, relationship_name, kwargs)
             self._modified_relationships.add((tgt_id, src_id, relationship_name))
             logger.info(
@@ -797,6 +808,7 @@ class SemanticGraph:
                     rel_type = edge_data.get("type", "RELATED_TO")
                     tgt_uid = self._index_to_uid.get(tgt_idx, "")
                     if tgt_uid:
+                        self._relation_type_index.remove(uid, tgt_uid, rel_type)
                         self._deleted_relationships.add((uid, tgt_uid, rel_type))
 
             for src_idx, _, edge_data in self.rx_graph.in_edges(idx):
@@ -804,6 +816,7 @@ class SemanticGraph:
                     rel_type = edge_data.get("type", "RELATED_TO")
                     src_uid = self._index_to_uid.get(src_idx, "")
                     if src_uid:
+                        self._relation_type_index.remove(src_uid, uid, rel_type)
                         self._deleted_relationships.add((src_uid, uid, rel_type))
 
             self.rx_graph.remove_node(idx)
@@ -849,6 +862,9 @@ class SemanticGraph:
                 edge_data = self.rx_graph.get_edge_data_by_index(edge_idx)
                 if edge_data and edge_data.get("type") == relationship_name:
                     self.rx_graph.remove_edge_from_index(edge_idx)
+                    self._relation_type_index.remove(
+                        source_uid, target_uid, relationship_name
+                    )
                     self._deleted_relationships.add(
                         (source_uid, target_uid, relationship_name)
                     )
@@ -879,6 +895,7 @@ class SemanticGraph:
                 edge_data = self.rx_graph.get_edge_data_by_index(edge_idx)
                 if edge_data:
                     rel_type = edge_data.get("type", "RELATED_TO")
+                    self._relation_type_index.remove(source_uid, target_uid, rel_type)
                     self._deleted_relationships.add((source_uid, target_uid, rel_type))
                 self.rx_graph.remove_edge_from_index(edge_idx)
 
@@ -1179,6 +1196,32 @@ class SemanticGraph:
         else:
             return graph_retriever.hybrid_node_search(query, top_k, **kwargs)
 
+    def get_edges_by_relation_types(
+        self,
+        relation_types: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """Return explicit edges, optionally restricted to relation types.
+
+        Reads the derived relation-type inverted index, so a type-filtered query
+        does not enumerate every edge of the graph. ``relation_types=None``
+        returns all edges in insertion order.
+
+        Args:
+            relation_types: Optional relation type filter.
+            limit: Optional maximum number of edges to return.
+
+        Returns:
+            Tuples of ``(source_uid, target_uid, edge_attributes)``.
+        """
+        entries = self._relation_type_index.lookup(relation_types)
+        if limit is not None:
+            entries = entries[:limit]
+        return [
+            (entry.source_uid, entry.target_uid, dict(entry.data))
+            for entry in entries
+        ]
+
     def search_graph_relations(self,
                             seed_nodes: Optional[List[str]] = None,
                             relation_types: Optional[List[str]] = None,
@@ -1195,38 +1238,33 @@ class SemanticGraph:
         Returns:
             Tuples of ``(source_uid, target_uid, edge_attributes)``.
         """
+        if not seed_nodes:
+            # Without seeds this is a pure "edges of these types" query, answered
+            # by the relation-type index rather than a full edge scan, and it
+            # needs no retriever. (Before P2+ this branch scanned every edge and
+            # was gated behind the graph retriever.)
+            return self.get_edges_by_relation_types(relation_types, limit=limit)
+
+        # Local import mirrors the other runtime uses in this module: the
+        # retrieval package is imported lazily to keep the core import graph
+        # acyclic.
+        from ..retrieval.retrieval_interface import RetrievalMethod
+
         multi_retriever = self.get_multi_retriever()
         if not multi_retriever:
             return []
-        
+
         if RetrievalMethod.GRAPH_TRAVERSAL not in multi_retriever.retrievers:
             logger.warning("Graph retriever is unavailable.")
             return []
-        
+
         graph_retriever = multi_retriever.retrievers[RetrievalMethod.GRAPH_TRAVERSAL]
-        
-        if seed_nodes:
-            return graph_retriever.edge_bfs_search(
-                origin_node_uids=seed_nodes,
-                max_depth=max_depth,
-                relation_types=relation_types,
-                limit=limit
-            )
-        else:
-            edges = []
-            for edge_idx in self.rx_graph.edge_indices():
-                src_idx, tgt_idx = self.rx_graph.get_edge_endpoints_by_index(edge_idx)
-                data = self.rx_graph.get_edge_data_by_index(edge_idx)
-                if relation_types and data.get('type') not in relation_types:
-                    continue
-                
-                src_uid = self._index_to_uid.get(src_idx, "")
-                tgt_uid = self._index_to_uid.get(tgt_idx, "")
-                if src_uid and tgt_uid:
-                    edges.append((src_uid, tgt_uid, data))
-                if len(edges) >= limit:
-                    break
-            return edges
+        return graph_retriever.edge_bfs_search(
+            origin_node_uids=seed_nodes,
+            max_depth=max_depth,
+            relation_types=relation_types,
+            limit=limit
+        )
 
     def get_node_neighbors(self,
                         node_uid: str,
@@ -1960,6 +1998,16 @@ class SemanticGraph:
                         instance._index_to_uid[idx] = uid
         else:
             logger.warning("Graph file rx_graph.pkl was not found; initializing an empty graph.")
+
+        # The relation-type index is derived state; rebuild it from the restored
+        # topology instead of persisting a second copy that could drift.
+        instance._relation_type_index.rebuild(
+            instance.rx_graph, instance._index_to_uid
+        )
+        logger.info(
+            f"Relation-type index rebuilt: {len(instance._relation_type_index)} edges across "
+            f"{len(instance._relation_type_index.relation_types)} types."
+        )
 
         
         retrieval_indices_dir = os.path.join(directory_path, "retrieval_indices")
