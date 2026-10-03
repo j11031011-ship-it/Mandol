@@ -15,6 +15,7 @@ import rustworkx as rx
 # from .retrieval_interface import RetrievalMethod
 
 if TYPE_CHECKING:
+    from ..constraints.query_constraints import QueryConstraints
     from ..retrieval.advance_retriever import MultiRetriever
     from ..retrieval.retrieval_interface import RetrievalMethod
     from ..storage.rocksdb_payload_store import RocksDBPayloadStore
@@ -1093,6 +1094,55 @@ class SemanticGraph:
             return results
         else:
             return [unit for unit, _ in results]
+
+    def search_constrained(
+        self,
+        query_text: str,
+        constraints: Optional["QueryConstraints"] = None,
+        top_k: int = 10,
+        return_score: bool = False,
+        **kwargs,
+    ) -> Union[List[MemoryUnit], List[Tuple[MemoryUnit, float]]]:
+        """Run constraint-aware hybrid retrieval over the graph layer.
+
+        The facade delegates to ``ConstraintAwarePlanner``: every declared
+        constraint is resolved into a candidate UID set, the sets are
+        intersected (AND semantics), and fused retrieval results are
+        post-filtered against the intersection before ``top_k`` is applied.
+        The underlying retriever is not asked for a reduced candidate pool yet —
+        the ``candidate_uids`` pre-filter push-down is the next milestone.
+
+        Args:
+            query_text: Query text passed to the underlying retriever.
+            constraints: Declarative constraint bundle; ``None`` behaves like
+                an empty bundle (plain smart search).
+            top_k: Number of results to return after filtering.
+            return_score: Whether to return ``(unit, score)`` tuples instead of
+                bare memory units.
+            **kwargs: Additional ``MultiRetriever.smart_search`` options such as
+                ``methods`` or ``fusion_method``.
+
+        Returns:
+            Ranked memory units (or ``(unit, score)`` tuples) satisfying every
+            declared constraint.
+
+        Raises:
+            NotImplementedError: If a relation constraint is declared; the
+                depth-limited BFS resolver arrives with the P2 milestone.
+        """
+        from ..constraints.planner import ConstraintAwarePlanner
+        from ..constraints.query_constraints import QueryConstraints
+
+        planner = ConstraintAwarePlanner(self)
+        results = planner.execute_query(
+            query_text,
+            constraints if constraints is not None else QueryConstraints(),
+            top_k=top_k,
+            **kwargs,
+        )
+        if return_score:
+            return results
+        return [unit for unit, _ in results]
 
     def search_graph_nodes(self, 
                         query: str, 
