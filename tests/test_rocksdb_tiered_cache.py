@@ -14,6 +14,7 @@ import pytest
 from mandol.core.memory_unit import MemoryUnit
 from mandol.core.semantic_graph import SemanticGraph
 from mandol.core.semantic_map import SemanticMap
+from mandol.constraints.resolvers import MetadataConstraintResolver
 from mandol.retrieval.bm25_retriever import BM25Retriever
 from mandol.retrieval.retrieval_interface import RetrievalMethod
 from mandol.retrieval.splade_retriever import SPLADERetriever
@@ -688,6 +689,61 @@ def test_tiered_checkpoint_restores_paging_and_graph_state(
         "checkpoint-target",
         "RELATED_TO",
     ) == {}
+
+    restored.close()
+    graph.close()
+
+
+def test_tiered_checkpoint_indexes_cold_payloads_for_constraints(
+    tmp_path: Path,
+    semantic_map_factory,
+    monkeypatch,
+) -> None:
+    """Cold payloads must remain resolvable after a checkpoint reload.
+
+    The filterable-field registry is restored before the payload store is
+    reconnected, so the reload path has to index non-resident payloads without
+    materializing them.
+    """
+    monkeypatch.setattr(
+        SemanticGraph,
+        "get_multi_retriever",
+        lambda self: _DummyMultiRetriever(),
+    )
+    semantic_map = semantic_map_factory()
+    graph = SemanticGraph(semantic_map)
+    assert graph.connect_to_l2(
+        str(tmp_path / "runtime"),
+        max_capacity=10,
+        high_watermark=9,
+        low_watermark=5,
+    )
+    semantic_map.register_filterable_fields(["source"])
+    for uid in ("cold-indexed", "resident-indexed"):
+        graph.add_unit(
+            _unit(uid),
+            explicit_content_for_embedding=f"{uid} payload",
+            space_names=["test-space"],
+            generate_sparse_embedding=False,
+        )
+    assert _evict_now(semantic_map).removed_count == 1
+    cold_uid = next(
+        uid
+        for uid in ("cold-indexed", "resident-indexed")
+        if uid not in semantic_map.memory_units
+    )
+
+    checkpoint_dir = tmp_path / "tiered-index-checkpoint"
+    graph.save_graph(str(checkpoint_dir), build_sparse_vectors=False)
+    restored = SemanticGraph.load_graph(str(checkpoint_dir))
+
+    assert cold_uid not in restored.semantic_map.memory_units
+    resolved = MetadataConstraintResolver(
+        restored.semantic_map, {"source": {"eq": "storage-test"}}
+    ).resolve()
+    assert resolved.uids == {"cold-indexed", "resident-indexed"}
+    assert cold_uid not in restored.semantic_map.memory_units
+    assert restored.get_unit(cold_uid) is not None
 
     restored.close()
     graph.close()

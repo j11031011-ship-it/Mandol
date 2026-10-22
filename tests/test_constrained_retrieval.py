@@ -82,6 +82,30 @@ class _StubMultiRetriever:
         return list(self.results)
 
 
+class _SaturatedMultiRetriever:
+    """Serves a full pool of non-candidate units, then reveals candidates."""
+
+    def __init__(self, semantic_map):
+        self.semantic_map = semantic_map
+        self.calls = []
+        self._outsiders = [
+            MemoryUnit(f"x{index}", {"text_content": f"outsider {index}"})
+            for index in range(200)
+        ]
+
+    def smart_search(self, query, **kwargs):
+        del query
+        limit = kwargs["top_k"]
+        self.calls.append(limit)
+        if limit <= 50:
+            return [(unit, 2.0) for unit in self._outsiders[:limit]]
+        valid = [
+            (self.semantic_map.get_unit("u1"), 1.0),
+            (self.semantic_map.get_unit("u3"), 0.9),
+        ]
+        return valid + [(unit, 2.0) for unit in self._outsiders[: limit - len(valid)]]
+
+
 @pytest.fixture
 def graph_factory(monkeypatch):
     original_loader = global_model_manager.get_or_load_model
@@ -185,6 +209,29 @@ def test_metadata_resolver_matches_filter_memory_units_semantics(graph_factory) 
     assert resolved_excludes.uids == excludes_uids == {"u2", "u6"}
 
 
+def test_filterable_field_registry_survives_save_and_load(
+    graph_factory, tmp_path
+) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    semantic_map.register_filterable_fields({"speaker": "hash", "timestamp": "sorted"})
+
+    checkpoint = tmp_path / "map"
+    semantic_map.save_map(str(checkpoint), build_sparse_vectors=False)
+    restored = SemanticMap.load_map(str(checkpoint))
+
+    assert restored._metadata_index.field_kinds == {
+        "speaker": "hash",
+        "timestamp": "sorted",
+    }
+    assert MetadataConstraintResolver(
+        restored, {"speaker": {"eq": "speaker_a"}}
+    ).resolve().uids == {"u1", "u3", "u6"}
+    assert TimeRangeConstraintResolver(
+        restored, TimeRange(start="2024-05-01T00:00:00")
+    ).resolve().uids == {"u5", "u6"}
+
+
 def test_time_range_resolver_filters_raw_timestamps(graph_factory) -> None:
     graph = _build_graph(graph_factory, DEFAULT_UNITS)
     semantic_map = graph.semantic_map
@@ -199,6 +246,85 @@ def test_time_range_resolver_filters_raw_timestamps(graph_factory) -> None:
         TimeRange(start="2024-02-01T00:00:00", end="2024-04-30T23:59:59"),
     ).resolve()
     assert window.uids == {"u2", "u3", "u4"}
+
+
+def test_time_range_scan_normalizes_mixed_timestamp_formats(graph_factory) -> None:
+    """Without a sorted index the scan must still compare normalized epochs.
+
+    ``n1`` and ``n2`` are the same instant in ISO and epoch form; ``n3`` is a
+    LoCoMo-style string outside the window; ``n4`` is unparsable and dropped.
+    """
+    units = [
+        ("n1", "iso timestamp", "2024-01-05T08:00:00", "speaker_a", "s-daily"),
+        ("n2", "epoch timestamp", 1704441600.0, "speaker_a", "s-daily"),
+        ("n3", "locomo timestamp", "1:56 pm on 8 May, 2023", "speaker_a", "s-daily"),
+        ("n4", "garbage timestamp", "not a date", "speaker_a", "s-daily"),
+    ]
+    graph = _build_graph(graph_factory, units)
+
+    resolved = TimeRangeConstraintResolver(
+        graph.semantic_map,
+        TimeRange(start="2024-01-01T00:00:00", end="2024-01-31T23:59:59"),
+    ).resolve()
+
+    assert resolved.uids == {"n1", "n2"}
+
+
+def test_time_range_scan_rejects_unparsable_bounds(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+
+    with pytest.raises(ValueError, match="TimeRange.start"):
+        TimeRangeConstraintResolver(
+            graph.semantic_map, TimeRange(start="yesterday")
+        ).resolve()
+
+
+def test_constraint_declarations_are_validated() -> None:
+    with pytest.raises(ValueError, match="field"):
+        TimeRange(field=" ")
+    with pytest.raises(ValueError, match="seed_uids"):
+        RelationConstraint(seed_uids=[])
+    with pytest.raises(ValueError, match="max_depth"):
+        RelationConstraint(seed_uids=["u1"], max_depth=0)
+    with pytest.raises(ValueError, match="direction"):
+        RelationConstraint(seed_uids=["u1"], direction="outgoing")
+    with pytest.raises(ValueError, match="relation_types"):
+        RelationConstraint(seed_uids=["u1"], relation_types=[""])
+
+
+def test_metadata_resolver_rejects_unknown_operator(graph_factory) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+
+    with pytest.raises(ValueError, match="Unsupported filter operator"):
+        MetadataConstraintResolver(
+            graph.semantic_map, {"speaker": {"equals": "speaker_a"}}
+        )
+
+
+def test_metadata_resolver_reads_unit_metadata_dict(graph_factory) -> None:
+    graph = graph_factory()
+    graph.semantic_map.add_unit(
+        MemoryUnit(
+            "m1",
+            {"text_content": "metadata-only field"},
+            {"project": "alpha"},
+        ),
+        explicit_content_for_embedding="metadata-only field",
+        space_names=["s-work"],
+        generate_sparse_embedding=False,
+    )
+
+    resolved = MetadataConstraintResolver(
+        graph.semantic_map, {"project": {"eq": "alpha"}}
+    ).resolve()
+    baseline = {
+        unit.uid
+        for unit in graph.semantic_map.filter_memory_units(
+            filter_condition={"project": {"eq": "alpha"}}
+        )
+    }
+
+    assert resolved.uids == baseline == {"m1"}
 
 
 def test_time_range_resolver_skips_units_without_timestamp(graph_factory) -> None:
@@ -642,14 +768,20 @@ def test_index_maintenance_tracks_insertions_deletions_and_tiered_swap(
     }
 
     evicted = semantic_map.get_unit("u1")
+    # Simulate the known-UID catalog a tiered map maintains across paging.
+    semantic_map._storage_uids = {uid for uid, *_ in DEFAULT_UNITS}
     assert semantic_map._remove_from_l1_for_tiered_swap(["u1"]) == 1
+
+    # The constraint index retains evicted values so constrained retrieval can
+    # still resolve cold units; the legacy L1-only linear filter cannot.
     resolved = MetadataConstraintResolver(semantic_map, filters).resolve()
     baseline = {
         unit.uid
         for unit in semantic_map.filter_memory_units(filter_condition=filters)
     }
-    assert resolved.uids == baseline == {"u3", "u6"}
-    assert resolved.total == len(DEFAULT_UNITS) - 1
+    assert resolved.uids == {"u1", "u3", "u6"}
+    assert baseline == {"u3", "u6"}
+    assert resolved.total == len(DEFAULT_UNITS)
 
     semantic_map._add_to_l1_from_tiered_swap([evicted])
     assert MetadataConstraintResolver(semantic_map, filters).resolve().uids == {
@@ -741,6 +873,65 @@ def test_execute_query_propagates_caller_candidates_on_post_filter(
     _, call_kwargs = stub.calls[0]
     # The caller filter is intersected with the constraints before push-down.
     assert call_kwargs["candidate_uids"] == ["u6"]
+
+
+def test_execute_query_verifies_caller_candidates_without_constraints(
+    graph_factory, monkeypatch
+) -> None:
+    """A caller-supplied candidate filter is a constraint and must be re-checked.
+
+    Backends may push ``candidate_uids`` down, but graph expansion can still
+    return units outside the caller set; the planner must filter them even when
+    no declarative constraint is present.
+    """
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    semantic_map = graph.semantic_map
+    stub = _StubMultiRetriever(
+        [(semantic_map.get_unit("u4"), 0.9), (semantic_map.get_unit("u1"), 0.8)]
+    )
+    monkeypatch.setattr(graph, "get_multi_retriever", lambda: stub)
+
+    planner = ConstraintAwarePlanner(graph)
+    results = planner.execute_query(
+        "hiking", QueryConstraints(), top_k=2, candidate_uids=["u4"]
+    )
+
+    assert [unit.uid for unit, _ in results] == ["u4"]
+    _, call_kwargs = stub.calls[0]
+    assert call_kwargs["candidate_uids"] == ["u4"]
+
+
+def test_execute_query_expands_pool_until_constrained_results_fill_top_k(
+    graph_factory, monkeypatch
+) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    stub = _SaturatedMultiRetriever(graph.semantic_map)
+    monkeypatch.setattr(graph, "get_multi_retriever", lambda: stub)
+
+    planner = ConstraintAwarePlanner(graph)
+    results = planner.execute_query(
+        "coffee", QueryConstraints(space_names=["s-daily"]), top_k=2
+    )
+
+    assert [unit.uid for unit, _ in results] == ["u1", "u3"]
+    assert stub.calls == [50, 100]
+
+
+def test_plan_records_dropped_constraints(graph_factory, monkeypatch) -> None:
+    graph = _build_graph(graph_factory, DEFAULT_UNITS)
+    planner = ConstraintAwarePlanner(
+        graph, fallback_policy=FallbackPolicy(DROP_CONSTRAINT)
+    )
+    constraints = QueryConstraints(
+        metadata_filters={"speaker": {"eq": "speaker_c"}},
+        space_names=["s-work"],
+    )
+
+    _spy_on_planner_warnings(monkeypatch)
+    plan = planner.plan(constraints, top_k=5)
+
+    assert plan.candidate_set.uids == {"u2", "u5"}
+    assert plan.dropped_constraints == ("metadata_filters",)
 
 
 def test_search_constrained_prefilter_matches_post_filter_baseline(graph_factory) -> None:

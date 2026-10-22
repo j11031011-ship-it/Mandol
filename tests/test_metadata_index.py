@@ -104,18 +104,53 @@ def test_hash_index_combines_conditions_and_updates() -> None:
     assert index.lookup({"eq": "b"}).uids == {"u1"}
 
 
-def test_hash_index_can_serve_rejects_unsupported_shapes() -> None:
-    index = HashIndex("payload")
-    index.add("u1", {"nested": "dict"})
-    assert not index.can_serve({"eq": "x"})
+def test_hash_index_projects_container_values() -> None:
+    index = HashIndex("entity_ids")
+    index.add("u1", ["alice", "bob"])
+    index.add("u2", ["bob"])
+    index.add("u3", ("alice", "bob"))
+    index.add("u4", {"tier": "gold", "tags": ["vip"]})
+    index.add("u5", {"tags": ["vip"], "tier": "gold"})
+    index.add("u6", {"tier": "silver"})
+    index.add("u7", {"alice", "bob"})
 
+    assert index.lookup({"eq": ["alice", "bob"]}).uids == {"u1"}
+    assert index.lookup({"eq": ("alice", "bob")}).uids == {"u3"}
+    assert index.lookup({"in": [["bob"], ("alice", "bob")]}).uids == {"u2", "u3"}
+    assert index.lookup({"eq": {"tags": ["vip"], "tier": "gold"}}).uids == {"u4", "u5"}
+    assert index.lookup({"eq": frozenset({"bob", "alice"})}).uids == {"u7"}
+    assert index.lookup({"ne": {"tier": "gold", "tags": ["vip"]}}).uids == {
+        "u1",
+        "u2",
+        "u3",
+        "u6",
+        "u7",
+    }
+
+
+def test_hash_index_can_serve_rejects_unsupported_shapes() -> None:
     index = HashIndex("speaker")
     index.add("u1", "a")
     assert index.can_serve({"eq": "a"})
+    assert index.can_serve({"eq": ["projectable"]})
     assert not index.can_serve({})
     assert not index.can_serve({"gt": 1})
-    assert not index.can_serve({"eq": ["unhashable"]})
     assert not index.can_serve({"in": "string"})
+
+
+def test_hash_index_falls_back_for_unprojectable_values() -> None:
+    class _Opaque:
+        __hash__ = None
+
+        def __eq__(self, other):
+            return isinstance(other, _Opaque)
+
+    index = HashIndex("payload")
+    index.add("u1", "indexable")
+    assert index.can_serve({"eq": "indexable"})
+
+    index.add("u2", _Opaque())
+    assert not index.can_serve({"eq": "indexable"})
 
 
 def test_sorted_index_ordering_windows() -> None:
@@ -189,6 +224,20 @@ def test_metadata_index_registers_routes_and_serves() -> None:
     assert index.lookup({}) is None
 
 
+def test_metadata_index_serves_container_fields() -> None:
+    index = MetadataIndex()
+    index.register_fields(["entity_ids"])
+    index.add_units(
+        [
+            _unit("u1", entity_ids=["alice", "bob"]),
+            _unit("u2", entity_ids=["bob"]),
+        ]
+    )
+
+    assert index.lookup({"entity_ids": {"eq": ["alice", "bob"]}}).uids == {"u1"}
+    assert index.lookup({"entity_ids": {"in": [["bob"]]}}).uids == {"u2"}
+
+
 def test_metadata_index_register_fields_accepts_bare_iterables() -> None:
     index = MetadataIndex()
     index.register_fields(["speaker"])
@@ -196,6 +245,17 @@ def test_metadata_index_register_fields_accepts_bare_iterables() -> None:
 
     with pytest.raises(ValueError):
         index.register_fields({"speaker": "btree"})
+
+
+def test_metadata_index_exposes_field_kinds_for_persistence() -> None:
+    index = MetadataIndex()
+    index.register_fields({"speaker": "hash", "timestamp": "sorted"})
+
+    kinds = index.field_kinds
+    assert kinds == {"speaker": "hash", "timestamp": "sorted"}
+
+    kinds["speaker"] = "sorted"
+    assert index.field_kinds["speaker"] == "hash"
 
 
 def test_metadata_index_cache_tracks_mutations() -> None:
@@ -255,9 +315,14 @@ def test_metadata_index_mutations_are_noops_without_registration() -> None:
     assert index.lookup({"speaker": {"eq": "a"}}) is None
 
 
-def test_resolve_field_value_prefers_attributes_then_raw_data() -> None:
+def test_resolve_field_value_prefers_attributes_then_raw_data_then_metadata() -> None:
     unit = _unit("u1", speaker="a")
+    unit.metadata["project"] = "alpha"
 
     assert resolve_field_value(unit, "speaker") == "a"
     assert resolve_field_value(unit, "uid") == "u1"
+    assert resolve_field_value(unit, "project") == "alpha"
     assert resolve_field_value(unit, "missing") is None
+
+    unit.raw_data["project"] = "raw-wins"
+    assert resolve_field_value(unit, "project") == "raw-wins"

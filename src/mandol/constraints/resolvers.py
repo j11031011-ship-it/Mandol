@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from ..core.semantic_map import SemanticMap
 
 _ORDERING_OPERATORS = ("gt", "gte", "lt", "lte")
+_SUPPORTED_OPERATORS = frozenset(
+    {"eq", "ne", "in", "nin", "gt", "gte", "lt", "lte", "contain", "not_contain"}
+)
 
 
 def _resolve_field_value(unit: "MemoryUnit", field: str) -> Any:
@@ -30,6 +33,8 @@ def _resolve_field_value(unit: "MemoryUnit", field: str) -> Any:
     value = getattr(unit, field, None)
     if value is None:
         value = unit.raw_data.get(field)
+    if value is None and isinstance(unit.metadata, dict):
+        value = unit.metadata.get(field)
     return value
 
 
@@ -59,6 +64,11 @@ def _unit_matches(unit: "MemoryUnit", filter_condition: Dict[str, Dict[str, Any]
     for field, conditions in filter_condition.items():
         value = _resolve_field_value(unit, field)
         for operator, expected in conditions.items():
+            if operator not in _SUPPORTED_OPERATORS:
+                raise ValueError(
+                    f"Unsupported filter operator {operator!r} on field {field!r}; "
+                    f"expected one of {sorted(_SUPPORTED_OPERATORS)}."
+                )
             if operator == "eq" and value != expected:
                 return False
             if operator == "ne" and value == expected:
@@ -110,8 +120,13 @@ class BaseConstraintResolver(ABC):
         return list(self.semantic_map.memory_units.values())
 
     def _total_units(self) -> int:
-        """Return the L1 unit count used for selectivity estimation."""
-        return len(self.semantic_map.memory_units)
+        """Return the known-unit count used for selectivity estimation.
+
+        Cold payloads remain known (and indexed) after tiered paging, so using
+        the resident count here would overestimate selectivity and make the
+        planner push a broad constraint down as if it were selective.
+        """
+        return self.semantic_map.total_unit_count
 
 
 class MetadataConstraintResolver(BaseConstraintResolver):
@@ -138,6 +153,21 @@ class MetadataConstraintResolver(BaseConstraintResolver):
         """
         super().__init__(semantic_map)
         self.filters = filters
+        self._validate_operators()
+
+    def _validate_operators(self) -> None:
+        """Reject unknown operators instead of silently ignoring the condition."""
+        for field, conditions in self.filters.items():
+            if not isinstance(conditions, dict):
+                raise ValueError(
+                    f"Filter for field {field!r} must be an operator mapping."
+                )
+            unknown = set(conditions) - _SUPPORTED_OPERATORS
+            if unknown:
+                raise ValueError(
+                    f"Unsupported filter operator(s) {sorted(unknown)} on field "
+                    f"{field!r}; expected one of {sorted(_SUPPORTED_OPERATORS)}."
+                )
 
     def resolve(self) -> CandidateSet:
         """Resolve the field conditions, preferring the registered index."""
@@ -172,10 +202,12 @@ class MetadataConstraintResolver(BaseConstraintResolver):
 class TimeRangeConstraintResolver(MetadataConstraintResolver):
     """Time-window resolver with a sorted-epoch fast path (P1).
 
-    The range is expressed as ``gte`` / ``lte`` conditions on the range field.
-    When the field is registered as a sorted index and both bounds normalize,
-    the lookup is a bisect over epoch floats; otherwise the inherited metadata
-    scan keeps the raw comparison semantics.
+    When the field is registered as a sorted index, the lookup is a bisect over
+    normalized epoch floats. Otherwise the scan below normalizes every payload
+    timestamp through ``TimestampNormalizer`` as well, so ISO strings, epoch
+    numbers, and LoCoMo-style strings compare correctly even when the sorted
+    index was not registered. Payloads whose timestamp cannot be parsed never
+    match an ordering predicate.
     """
 
     source = "time_range"
@@ -193,6 +225,45 @@ class TimeRangeConstraintResolver(MetadataConstraintResolver):
         if time_range.end is not None:
             conditions["lte"] = time_range.end
         super().__init__(semantic_map, {time_range.field: conditions})
+        self.time_range = time_range
+
+    def _resolve_via_scan(self) -> CandidateSet:
+        """Scan L1 payloads with normalized timestamp comparison."""
+        from ..indexes.timestamp_normalizer import TimestampNormalizer
+
+        normalizer = TimestampNormalizer()
+        start = self._normalize_bound(normalizer, self.time_range.start, "start")
+        end = self._normalize_bound(normalizer, self.time_range.end, "end")
+        total = self._total_units()
+        uids: Set[str] = set()
+        for unit in self._l1_units():
+            epoch = normalizer.normalize(
+                _resolve_field_value(unit, self.time_range.field)
+            )
+            if epoch is None:
+                continue
+            if start is not None and epoch < start:
+                continue
+            if end is not None and epoch > end:
+                continue
+            uids.add(unit.uid)
+        return CandidateSet.from_iterable(uids, source=self.source, total=total)
+
+    def _normalize_bound(
+        self,
+        normalizer: Any,
+        bound: Any,
+        name: str,
+    ) -> Optional[float]:
+        """Normalize one query bound, failing loudly when it is unparsable."""
+        if bound is None:
+            return None
+        epoch = normalizer.normalize(bound)
+        if epoch is None:
+            raise ValueError(
+                f"TimeRange.{name} is not a recognized timestamp: {bound!r}."
+            )
+        return epoch
 
 
 class SpaceConstraintResolver(BaseConstraintResolver):

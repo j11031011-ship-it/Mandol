@@ -42,13 +42,15 @@ _CACHE_MISS = object()
 def resolve_field_value(unit: "MemoryUnit", field: str) -> Any:
     """Resolve a payload field with the same lookup order as ``filter_memory_units``.
 
-    Attribute lookup comes first (mirroring ``getattr(unit, field, None)``) and
-    ``raw_data`` is the fallback, so index maintenance observes exactly the
-    values the linear resolver compares.
+    Attribute lookup comes first (mirroring ``getattr(unit, field, None)``),
+    then ``raw_data``, then the ``metadata`` dictionary, so index maintenance
+    observes exactly the values the linear resolver compares.
     """
     value = getattr(unit, field, None)
     if value is None:
         value = unit.raw_data.get(field)
+    if value is None and isinstance(unit.metadata, dict):
+        value = unit.metadata.get(field)
     return value
 
 
@@ -83,6 +85,11 @@ class MetadataIndex:
     def registered_fields(self) -> Tuple[str, ...]:
         """Names of the fields currently served by an index."""
         return tuple(self._indexes)
+
+    @property
+    def field_kinds(self) -> Dict[str, str]:
+        """Registered field -> strategy kind, suitable for persistence."""
+        return dict(self._kinds)
 
     def is_registered(self, field: str) -> bool:
         """Return whether ``field`` has a registered index."""

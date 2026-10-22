@@ -71,12 +71,15 @@ class ConstraintExecutionPlan:
         retrieval_top_k: Pool size requested from ``smart_search``.
         mode_reason: Human-readable justification for ``mode``, kept for
             diagnostics and the benchmark report.
+        dropped_constraints: Constraint sources the fallback policy relaxed
+            away; empty when every declared predicate was honored.
     """
 
     candidate_set: Optional[CandidateSet]
     mode: str
     retrieval_top_k: int
     mode_reason: str = ""
+    dropped_constraints: Tuple[str, ...] = ()
 
 
 class ConstraintAwarePlanner:
@@ -93,6 +96,7 @@ class ConstraintAwarePlanner:
         semantic_graph: "SemanticGraph",
         prefilter_selectivity_threshold: float = DEFAULT_PREFILTER_SELECTIVITY_THRESHOLD,
         fallback_policy: Optional[FallbackPolicy] = None,
+        max_pool_expansions: int = 2,
     ):
         """Initialize the planner.
 
@@ -104,10 +108,16 @@ class ConstraintAwarePlanner:
                 post-filtering fused results.
             fallback_policy: Degenerate-candidate handling; defaults to keeping
                 the degenerate set (so an unsatisfiable query returns nothing).
+            max_pool_expansions: How many times post-filtering may double the
+                retrieval pool while the backend is still saturated and the
+                constrained results have not filled ``top_k``.
         """
+        if max_pool_expansions < 0:
+            raise ValueError("max_pool_expansions must be non-negative.")
         self.semantic_graph = semantic_graph
         self.prefilter_selectivity_threshold = float(prefilter_selectivity_threshold)
         self.fallback_policy = fallback_policy or FallbackPolicy()
+        self.max_pool_expansions = int(max_pool_expansions)
 
     def _build_resolvers(
         self, constraints: QueryConstraints
@@ -143,9 +153,16 @@ class ConstraintAwarePlanner:
             The intersected candidate set, or ``None`` when the query declares
             no constraints.
         """
+        candidate_set, _ = self._resolve_candidates(constraints)
+        return candidate_set
+
+    def _resolve_candidates(
+        self, constraints: QueryConstraints
+    ) -> Tuple[Optional[CandidateSet], Tuple[str, ...]]:
+        """Resolve constraints and report which sources the fallback dropped."""
         resolvers = self._build_resolvers(constraints)
         if not resolvers:
-            return None
+            return None, ()
 
         resolved = [(resolver.source, resolver.resolve()) for resolver in resolvers]
         for source, candidate in resolved:
@@ -160,7 +177,7 @@ class ConstraintAwarePlanner:
         self,
         combined: CandidateSet,
         resolved: Sequence[Tuple[str, CandidateSet]],
-    ) -> CandidateSet:
+    ) -> Tuple[CandidateSet, Tuple[str, ...]]:
         """Relax a degenerate candidate set by dropping the most restrictive leaf.
 
         Predicates are dropped one at a time — always the one whose removal
@@ -168,20 +185,26 @@ class ConstraintAwarePlanner:
         The last predicate is never dropped, so a genuinely unmatched single
         predicate still yields its (possibly empty) set rather than silently
         turning the query into an unconstrained one.
+
+        Returns:
+            The (possibly relaxed) candidate set and the dropped constraint
+            sources, so plans and benchmarks can report the relaxation.
         """
         policy = self.fallback_policy
         if (
             len(combined) >= policy.min_candidates
             or not policy.relaxes_degenerate_queries
         ):
-            return combined
+            return combined, ()
 
         remaining = list(resolved)
         relaxed = combined
+        dropped: List[str] = []
         while len(relaxed) < policy.min_candidates and len(remaining) > 1:
             drop_index, candidate = self._most_relaxing_drop(remaining)
             dropped_source = remaining[drop_index][0]
             remaining.pop(drop_index)
+            dropped.append(dropped_source)
             logger.warning(
                 "Fallback policy dropped constraint '%s': %d candidate(s) is "
                 "below min_candidates=%d; relaxed set holds %d candidate(s).",
@@ -191,7 +214,7 @@ class ConstraintAwarePlanner:
                 len(candidate),
             )
             relaxed = candidate
-        return relaxed
+        return relaxed, tuple(dropped)
 
     @staticmethod
     def _most_relaxing_drop(
@@ -238,7 +261,7 @@ class ConstraintAwarePlanner:
         the post-filter path — push-down only pays off when it removes enough
         candidates to shrink the retrieval work.
         """
-        candidate_set = self.resolve_candidates(constraints)
+        candidate_set, dropped = self._resolve_candidates(constraints)
         if candidate_set is None:
             return ConstraintExecutionPlan(
                 candidate_set=None,
@@ -260,6 +283,7 @@ class ConstraintAwarePlanner:
             mode=mode,
             retrieval_top_k=self._retrieval_top_k(top_k, candidate_set, mode),
             mode_reason=reason,
+            dropped_constraints=dropped,
         )
 
     def execute_query(
@@ -302,37 +326,59 @@ class ConstraintAwarePlanner:
         search_kwargs: Dict[str, Any] = dict(kwargs)
         effective_set = plan.candidate_set
         if caller_candidates is not None:
-            if plan.candidate_set is None:
-                search_kwargs["candidate_uids"] = caller_candidates
-            else:
-                effective_set = plan.candidate_set.intersect(
-                    CandidateSet.from_iterable(
-                        caller_candidates, source="caller_candidates"
-                    )
+            caller_set = CandidateSet.from_iterable(
+                caller_candidates, source="caller_candidates"
+            )
+            effective_set = (
+                caller_set
+                if effective_set is None
+                else effective_set.intersect(caller_set)
+            )
+            if len(effective_set) == 0:
+                logger.info(
+                    "Caller candidate filter and constraints share no UIDs; "
+                    "skipping retrieval and returning no results."
                 )
-                if len(effective_set) == 0:
-                    logger.info(
-                        "Caller candidate filter and constraints share no UIDs; "
-                        "skipping retrieval and returning no results."
-                    )
-                    return []
-                search_kwargs["candidate_uids"] = list(effective_set)
+                return []
+            search_kwargs["candidate_uids"] = list(effective_set)
         elif plan.mode == "pre_filter":
             search_kwargs["candidate_uids"] = list(effective_set)
 
         multi_retriever = self.semantic_graph.get_multi_retriever()
-        results = multi_retriever.smart_search(
-            query_text, top_k=plan.retrieval_top_k, **search_kwargs
+        requested = plan.retrieval_top_k
+        latest = multi_retriever.smart_search(
+            query_text, top_k=requested, **search_kwargs
         )
+        results = latest
 
-        if plan.candidate_set is None:
+        if effective_set is None:
             return results[:top_k]
 
         # Final verification: backends and graph expansion may return units the
-        # push-down could not exclude, so constraints are always re-checked.
-        filtered = [
-            (unit, score) for unit, score in results if unit.uid in effective_set
-        ]
+        # push-down could not exclude, so constraints are re-checked even when
+        # the query was only narrowed by caller-supplied candidates.
+        filtered = self._filter_results(results, effective_set)
+        expansions = 0
+        while (
+            len(filtered) < top_k
+            and len(latest) >= requested
+            and expansions < self.max_pool_expansions
+        ):
+            requested *= 2
+            expansions += 1
+            logger.debug(
+                "Constrained retrieval filled %d/%d results; expanding the "
+                "retrieval pool to %d.",
+                len(filtered),
+                top_k,
+                requested,
+            )
+            latest = multi_retriever.smart_search(
+                query_text, top_k=requested, **search_kwargs
+            )
+            results = self._merge_results(results, latest)
+            filtered = self._filter_results(results, effective_set)
+
         logger.debug(
             "Constrained retrieval kept %d of %d fused results (mode=%s).",
             len(filtered),
@@ -340,3 +386,22 @@ class ConstraintAwarePlanner:
             plan.mode,
         )
         return filtered[:top_k]
+
+    @staticmethod
+    def _filter_results(
+        results: Sequence[Tuple["MemoryUnit", float]],
+        effective_set: CandidateSet,
+    ) -> List[Tuple["MemoryUnit", float]]:
+        """Keep the fused results whose UID belongs to the effective set."""
+        return [(unit, score) for unit, score in results if unit.uid in effective_set]
+
+    @staticmethod
+    def _merge_results(
+        existing: Sequence[Tuple["MemoryUnit", float]],
+        incoming: Sequence[Tuple["MemoryUnit", float]],
+    ) -> List[Tuple["MemoryUnit", float]]:
+        """Merge two result pools by UID, keeping the latest score per unit."""
+        by_uid = {unit.uid: (unit, score) for unit, score in existing}
+        for unit, score in incoming:
+            by_uid[unit.uid] = (unit, score)
+        return sorted(by_uid.values(), key=lambda item: item[1], reverse=True)

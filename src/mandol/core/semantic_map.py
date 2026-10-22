@@ -499,6 +499,7 @@ class SemanticMap(RetrievalInterface):
         """
         self._metadata_index.register_fields(fields)
         self._metadata_index.rebuild(self.memory_units.values())
+        self._index_cold_units()
 
     def _get_or_create_int_id(self, uid: str) -> int:
         """Return the stable global int_id for uid, allocating one if this is a new UID."""
@@ -600,8 +601,43 @@ class SemanticMap(RetrievalInterface):
             self._storage_uids = None
             self.tiered_storage_manager = None
             raise
+        self._index_cold_units()
         self._trigger_tiered_eviction_if_needed()
         return self.tiered_storage_manager
+
+    def _index_cold_units(self) -> int:
+        """Index persistent payloads that are absent from L1.
+
+        Restored maps register filterable fields before the payload store is
+        reconnected, so without this pass cold records would be invisible to
+        indexed constraint resolution until paged back into L1. Cold payloads
+        are decoded only to feed the metadata index; they do not become
+        resident and stay subject to normal paging.
+        """
+        store = self._external_storage
+        batch_getter = (
+            getattr(store, "get_units_batch", None) if store is not None else None
+        )
+        if batch_getter is None or not self._metadata_index.registered_fields:
+            return 0
+        cold_uids = sorted(
+            (self._storage_uids or set()) - set(self.memory_units)
+        )
+        indexed = 0
+        batch_size = 256
+        for start in range(0, len(cold_uids), batch_size):
+            units = batch_getter(cold_uids[start:start + batch_size])
+            if not units:
+                continue
+            self._metadata_index.add_units(units)
+            indexed += len(units)
+        if indexed:
+            logger.info(
+                "Indexed %d cold payloads for constraint resolution without "
+                "materializing them into L1.",
+                indexed,
+            )
+        return indexed
 
     def _close_tiered_storage(self) -> None:
         """Close paging resources without materializing cold payloads."""
@@ -649,16 +685,20 @@ class SemanticMap(RetrievalInterface):
         return candidates[: min(count, len(candidates))]
 
     def _remove_from_l1_for_tiered_swap(self, uids: List[str]) -> int:
-        """Remove payloads while preserving all resident retrieval and graph state."""
+        """Remove payloads while preserving all resident retrieval and graph state.
+
+        The metadata index keeps its ``uid -> value`` entries for evicted units:
+        constraints must still resolve cold records, which retrieval pages back
+        through ``get_unit`` on demand. Deleting the entries here would make
+        constrained retrieval silently ignore the cold tier.
+        """
         if not uids:
             return 0
 
         removed_count = 0
-        evicted_uids: List[str] = []
         for uid in uids:
             if uid in self.memory_units:
                 del self.memory_units[uid]
-                evicted_uids.append(uid)
                 removed_count += 1
             self._modified_units.discard(uid)
             self._access_counts.pop(uid, None)
@@ -666,7 +706,6 @@ class SemanticMap(RetrievalInterface):
             if self._storage_uids is not None:
                 self._storage_uids.add(uid)
 
-        self._metadata_index.remove_units(evicted_uids)
         if removed_count:
             logger.info(
                 "Tiered storage evicted %d payloads; indexes, UID mappings, "
@@ -711,6 +750,11 @@ class SemanticMap(RetrievalInterface):
         if self._storage_uids is None:
             return len(self.memory_units)
         return len(self._storage_uids.union(self.memory_units))
+
+    @property
+    def total_unit_count(self) -> int:
+        """Number of known units, including payloads paged out to cold storage."""
+        return self._total_unit_count()
 
     def _remove_aux_retriever_uids(self, uids: List[str]) -> None:
         multi_retriever = getattr(self, "_multi_retriever", None)
@@ -2998,6 +3042,7 @@ class SemanticMap(RetrievalInterface):
                 "supported_modalities": self.supported_modalities,
                 "image_model": self._embedding_model_name if "image" in self.supported_modalities else None,
                 "text_model": self._embedding_model_name,
+                "filterable_fields": self._metadata_index.field_kinds,
             },
             "memory_spaces": {
                 name: {
@@ -3082,7 +3127,10 @@ class SemanticMap(RetrievalInterface):
             unit.created_time = u_data.get("created_time")
             instance.memory_units[uid] = unit
 
-        
+        filterable_fields = config.get("filterable_fields")
+        if filterable_fields:
+            instance.register_filterable_fields(filterable_fields)
+
         dense_st_path = os.path.join(directory_path, "dense_vectors.safetensors")
         dense_uids_json_path = os.path.join(directory_path, "dense_uids.json")
 
@@ -3216,6 +3264,8 @@ class SemanticMap(RetrievalInterface):
                 val = getattr(unit, field, None)
                 if val is None:
                     val = unit.raw_data.get(field)
+                if val is None and isinstance(unit.metadata, dict):
+                    val = unit.metadata.get(field)
                 for op, op_val in cond.items():
                     if op == "eq" and not (val == op_val):
                         return False

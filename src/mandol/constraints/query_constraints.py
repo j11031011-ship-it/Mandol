@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+_RELATION_DIRECTIONS = frozenset({"successors", "predecessors", "both"})
+
 
 @dataclass(frozen=True)
 class TimeRange:
@@ -27,6 +29,15 @@ class TimeRange:
     end: Optional[Any] = None
     field: str = "timestamp"
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.field, str) or not self.field.strip():
+            raise ValueError("TimeRange.field must be a non-empty string.")
+
+    @property
+    def is_unbounded(self) -> bool:
+        """Return True when neither bound restricts the window."""
+        return self.start is None and self.end is None
+
 
 @dataclass(frozen=True)
 class RelationConstraint:
@@ -48,6 +59,25 @@ class RelationConstraint:
     max_depth: int = 1
     relation_types: Optional[List[str]] = None
     direction: str = "both"
+
+    def __post_init__(self) -> None:
+        if not self.seed_uids:
+            raise ValueError("RelationConstraint.seed_uids must contain at least one UID.")
+        if isinstance(self.max_depth, bool) or not isinstance(self.max_depth, int):
+            raise ValueError("RelationConstraint.max_depth must be an integer.")
+        if self.max_depth < 1:
+            raise ValueError("RelationConstraint.max_depth must be at least 1.")
+        if self.direction not in _RELATION_DIRECTIONS:
+            raise ValueError(
+                f"RelationConstraint.direction must be one of "
+                f"{sorted(_RELATION_DIRECTIONS)}, got {self.direction!r}."
+            )
+        if self.relation_types is not None and not all(
+            isinstance(item, str) and item for item in self.relation_types
+        ):
+            raise ValueError(
+                "RelationConstraint.relation_types must be non-empty strings."
+            )
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,8 @@
-"""Offline micro-benchmark for the constrained-retrieval stack (P3).
+"""Offline micro-benchmark for the constrained-retrieval stack (P3/P4).
 
-Measures the layers that P1/P2/P2+ replaced, on a synthetic corpus, without any
-network access or real model download (a deterministic dummy encoder stands in
-for the embedding model). The point is to quantify the *mechanisms*:
+Measures both the *mechanisms* and the end-to-end behaviour of constrained
+hybrid retrieval on a synthetic corpus, without any network access or real model
+download (a deterministic dummy encoder stands in for the embedding model):
 
 * metadata equality / time-window resolution: index lookup vs linear scan;
 * relation one-hop resolution: adjacency BFS vs a full edge scan;
@@ -13,7 +13,19 @@ for the embedding model). The point is to quantify the *mechanisms*:
 * post-filter pool sizing: when the selectivity-aware expansion grows the pool
   past the baseline ``max(top_k * 3, 50)`` expansion;
 * fallback policy: what a degenerate intersection yields under
-  ``RETURN_EMPTY`` (default) and under ``DROP_CONSTRAINT``.
+  ``RETURN_EMPTY`` (default) and under ``DROP_CONSTRAINT``, plus the dropped-
+  constraint audit recorded on the plan;
+* end-to-end joint retrieval: recall@k, fill rate, and latency of the planner
+  against a naive "retrieve top_k, then filter" baseline, for a selective
+  (pre-filter) and a broad (post-filter) query profile;
+* index maintenance: build time, incremental add/remove cost, and resident
+  index memory.
+
+The end-to-end ground truth is defined by the same deterministic encoder: for
+each query it is the top-k constraint-satisfying units ranked by cosine
+similarity. That isolates *execution strategy* (where constraints enter the
+pipeline) from semantic quality, which is what this benchmark measures; it is
+not a real-dataset retrieval-quality claim.
 
 Run from the repository root:
 
@@ -25,8 +37,10 @@ from __future__ import annotations
 import logging
 import random
 import time
+import tracemalloc
+from collections import Counter
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -44,6 +58,7 @@ from mandol.constraints.resolvers import RelationConstraintResolver
 from mandol.core.memory_unit import MemoryUnit
 from mandol.core.semantic_graph import SemanticGraph
 from mandol.core.semantic_map import SemanticMap
+from mandol.indexes import MetadataIndex
 from mandol.utils.logging_config import set_log_level
 from mandol.utils.model_manager import global_model_manager
 
@@ -55,6 +70,8 @@ RELATION_TYPES = ("FOLLOWED_BY", "MENTION_OF", "NEXT", "SHARED_TOPIC", "LOCATED_
 REPEATS = 5
 TOP_K = 10
 START = datetime(2024, 1, 1)
+EVAL_QUERIES = 10
+EVAL_REPEATS = 3
 
 
 class _DummyEmbeddingModel:
@@ -292,10 +309,232 @@ def bench_fallback(graph: SemanticGraph) -> None:
             planner_module.logger.warning = original_warning
         print(
             f"  {policy.on_degenerate:<14} -> {len(plan.candidate_set):>4} candidates, "
-            f"mode={plan.mode}"
+            f"mode={plan.mode}, dropped={plan.dropped_constraints or '()'}"
         )
         for message in captured:
             print(f"      warning: {message}")
+
+
+def _top_similar_uids(
+    semantic_map: SemanticMap,
+    query_text: str,
+    allowed: Set[str],
+    k: int,
+) -> Set[str]:
+    """Rank ``allowed`` by cosine similarity to the query under the dummy encoder."""
+    encoder = _DummyEmbeddingModel()
+    query_vec = encoder.encode(query_text)
+    query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+    scored: List[Tuple[float, str]] = []
+    for uid in allowed:
+        unit = semantic_map.memory_units[uid]
+        if unit.embedding is None:
+            continue
+        vec = np.asarray(unit.embedding, dtype=np.float32)
+        vec = vec / (np.linalg.norm(vec) + 1e-12)
+        scored.append((float(np.dot(query_vec, vec)), uid))
+    scored.sort(reverse=True)
+    return {uid for _, uid in scored[:k]}
+
+
+def _build_eval_queries(
+    graph: SemanticGraph,
+    *,
+    speakers_per_query: int,
+    window_days: int,
+    count: int,
+    seed: int,
+) -> List[Tuple[str, QueryConstraints, Set[str], Set[str]]]:
+    """Build (query, constraints, allowed UIDs, ground-truth UIDs) tuples."""
+    semantic_map = graph.semantic_map
+    units = list(semantic_map.memory_units.values())
+    timestamps = {
+        unit.uid: datetime.fromisoformat(unit.raw_data["timestamp"]) for unit in units
+    }
+    rng = random.Random(seed)
+    queries: List[Tuple[str, QueryConstraints, Set[str], Set[str]]] = []
+    attempts = 0
+    while len(queries) < count and attempts < count * 50:
+        attempts += 1
+        speakers = {
+            f"speaker_{index}"
+            for index in rng.sample(range(SPEAKERS), speakers_per_query)
+        }
+        latest_start_day = max(366 - window_days, 1)
+        start = START + timedelta(days=rng.randrange(latest_start_day))
+        end = start + timedelta(days=window_days)
+        allowed = {
+            unit.uid
+            for unit in units
+            if unit.raw_data.get("speaker") in speakers
+            and start <= timestamps[unit.uid] <= end
+        }
+        if len(allowed) < 2:
+            continue
+        target_uid = rng.choice(sorted(allowed))
+        query_text = semantic_map.memory_units[target_uid].raw_data["text_content"]
+        constraints = QueryConstraints(
+            metadata_filters={"speaker": {"in": sorted(speakers)}},
+            time_range=TimeRange(start=start.isoformat(), end=end.isoformat()),
+        )
+        queries.append(
+            (
+                query_text,
+                constraints,
+                allowed,
+                _top_similar_uids(semantic_map, query_text, allowed, TOP_K),
+            )
+        )
+    if len(queries) < count:
+        raise RuntimeError(
+            f"Could only build {len(queries)}/{count} evaluation queries."
+        )
+    return queries
+
+
+def _percentile(values: Sequence[float], fraction: float) -> float:
+    """Return a nearest-rank percentile of ``values``."""
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1))))
+    return ordered[index]
+
+
+def _evaluate_queries(
+    graph: SemanticGraph,
+    queries: Sequence[Tuple[str, QueryConstraints, Set[str], Set[str]]],
+    *,
+    constrained: bool,
+) -> Dict[str, float]:
+    """Measure recall, fill rate, and latency for one execution strategy."""
+    planner = ConstraintAwarePlanner(graph)
+    retriever = graph.get_multi_retriever()
+    latencies: List[float] = []
+    recalls: List[float] = []
+    fills: List[float] = []
+    sizes: List[float] = []
+    for query_text, constraints, allowed, truth in queries:
+        results: List[Tuple[MemoryUnit, float]] = []
+        for _ in range(EVAL_REPEATS):
+            started = time.perf_counter()
+            if constrained:
+                results = planner.execute_query(
+                    query_text,
+                    constraints,
+                    top_k=TOP_K,
+                    methods=["cosine_similarity"],
+                )
+            else:
+                fused = retriever.smart_search(
+                    query_text, top_k=TOP_K, methods=["cosine_similarity"]
+                )
+                results = [
+                    (unit, score) for unit, score in fused if unit.uid in allowed
+                ]
+            latencies.append((time.perf_counter() - started) * 1000.0)
+        returned = {unit.uid for unit, _ in results}
+        recalls.append(len(returned & truth) / len(truth) if truth else 0.0)
+        fills.append(len(results) / min(TOP_K, len(allowed)) if allowed else 0.0)
+        sizes.append(float(len(results)))
+    return {
+        "recall": sum(recalls) / len(recalls),
+        "fill": sum(fills) / len(fills),
+        "results": sum(sizes) / len(sizes),
+        "p50": _percentile(latencies, 0.50),
+        "p99": _percentile(latencies, 0.99),
+    }
+
+
+def bench_end_to_end(graph: SemanticGraph) -> None:
+    """Compare naive top-k post-filtering with constraint-aware execution."""
+    profiles = (
+        ("selective (2 spk/30d)", dict(speakers_per_query=2, window_days=30, seed=11)),
+        ("broad (24 spk/180d)", dict(speakers_per_query=24, window_days=180, seed=12)),
+    )
+    planner = ConstraintAwarePlanner(graph)
+
+    print(
+        f"\nH. end-to-end joint retrieval "
+        f"(top_k={TOP_K}, cosine backend, queries={EVAL_QUERIES})"
+    )
+    print(
+        f"  {'profile':<24} {'candidates':>10} {'strategy':<12} "
+        f"{'recall@k':>9} {'fill':>7} {'results':>8} {'P50ms':>7} {'P99ms':>7}"
+    )
+    print(
+        f"  {'':-<24} {'':-<10} {'':-<12} {'':-<9} {'':-<7} {'':-<8} "
+        f"{'':-<7} {'':-<7}"
+    )
+    for label, params in profiles:
+        queries = _build_eval_queries(graph, count=EVAL_QUERIES, **params)
+        modes = Counter(
+            planner.plan(constraints, TOP_K).mode
+            for _, constraints, _, _ in queries
+        )
+        mean_candidates = sum(len(allowed) for _, _, allowed, _ in queries) / len(
+            queries
+        )
+        print(
+            f"  -> {label}: mode={dict(modes)}, "
+            f"mean candidates={mean_candidates:.1f}"
+        )
+        for constrained, strategy in ((False, "post-only"), (True, "constrained")):
+            metrics = _evaluate_queries(graph, queries, constrained=constrained)
+            print(
+                f"  {'':<24} {'':>10} {strategy:<12} "
+                f"{metrics['recall']:>9.1%} {metrics['fill']:>7.1%} "
+                f"{metrics['results']:>8.1f} {metrics['p50']:>7.2f} "
+                f"{metrics['p99']:>7.2f}"
+            )
+
+
+def bench_maintenance(graph: SemanticGraph) -> None:
+    """Measure index build, incremental updates, and resident memory."""
+    units = list(graph.semantic_map.memory_units.values())
+    fields = {"speaker": "hash", "timestamp": "sorted"}
+
+    index = MetadataIndex()
+    index.register_fields(fields)
+    build_ms = _time(lambda: index.rebuild(units))
+
+    probes = [
+        MemoryUnit(
+            f"__bench_probe_{position}",
+            {
+                "text_content": f"probe {position}",
+                "speaker": f"speaker_{position % SPEAKERS}",
+                "timestamp": (START + timedelta(minutes=position)).isoformat(),
+            },
+        )
+        for position in range(100)
+    ]
+    started = time.perf_counter()
+    index.add_units(probes)
+    add_ms = (time.perf_counter() - started) * 1000.0
+    started = time.perf_counter()
+    index.remove_units([probe.uid for probe in probes])
+    remove_ms = (time.perf_counter() - started) * 1000.0
+
+    tracemalloc.start()
+    measured = MetadataIndex()
+    measured.register_fields(fields)
+    measured.rebuild(units)
+    current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    print(f"\nI. index maintenance (hash speaker + sorted timestamp, {UNITS} units)")
+    print(f"  {'full rebuild':<32} {build_ms:>10.2f} ms")
+    print(
+        f"  {'incremental add (100 units)':<32} {add_ms:>10.2f} ms "
+        f"({add_ms * 1000.0 / len(probes):>6.1f} us/unit)"
+    )
+    print(
+        f"  {'incremental remove (100 units)':<32} {remove_ms:>10.2f} ms "
+        f"({remove_ms * 1000.0 / len(probes):>6.1f} us/unit)"
+    )
+    print(
+        f"  {'resident memory':<32} {current_bytes / 1024.0:>10.1f} KB "
+        f"({current_bytes / UNITS:>6.1f} B/unit, peak {peak_bytes / 1024.0:.1f} KB)"
+    )
 
 
 def main() -> None:
@@ -312,12 +551,16 @@ def main() -> None:
     bench_modes(graph)
     bench_pool_sizing(graph)
     bench_fallback(graph)
+    bench_end_to_end(graph)
+    bench_maintenance(graph)
 
     print(
-        "\nNotes: baseline columns are the pre-optimization algorithms run "
-        "in-process (linear scan / full edge scan); the timing excludes model\n"
-        "encoding and vector search, which dominate end-to-end latency and are "
-        "unchanged by these milestones."
+        "\nNotes: sections A-F compare pre-optimization algorithms run in-process "
+        "(linear scan / full edge scan). Section H defines ground truth with the "
+        "same dummy\nencoder used by the backend, so it measures execution strategy "
+        "(where constraints enter the pipeline), not real-world semantic quality. "
+        "Section I timings\ncover the index layer only; map-level insertion also "
+        "updates FAISS, spaces, and retrievers."
     )
 
 
